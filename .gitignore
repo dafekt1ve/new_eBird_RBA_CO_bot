@@ -1,1 +1,34 @@
 .DS_Store
+.gitignore
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite database file
+*.db
+*.sqlite
+dipper_bot.db
+
+# Environment variables / secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# VSCode / editor settings
+.vscode/
+.idea/
+
+# Byte-compiled / temp files
+*.swp
+*.swo
+
+# Coverage reports
+htmlcov/
+.coverage
+
+# Test output
+test_output/

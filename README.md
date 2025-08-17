@@ -1,4 +1,4 @@
-# Colorado RBA Bot
+# Colorado's Discord RBA Bot
 
 A Discord bot for managing Rare Bird Alerts (RBA) in Colorado.  
 
