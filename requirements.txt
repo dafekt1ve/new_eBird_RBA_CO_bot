@@ -1,0 +1,5 @@
+discord.py>=2.3.0           # Discord API client
+pytz>=2023.3                # Timezone support
+timezonefinder>=6.3.0       # Lat/Lon → timezone lookup
+requests>=2.31.0            # HTTP requests for eBird API
+python-dotenv>=1.0.0        # Load .env files for bot tokens or API keys

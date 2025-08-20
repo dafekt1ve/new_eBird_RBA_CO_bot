@@ -1,9 +1,11 @@
+# db.py
 import sqlite3
 from datetime import datetime
 from db_schema import init_db
 from models import ThreadRecord, Observation, ChecklistModeration, MissedObservation
+from time_utils import ebird_local_to_utc  # <-- new
 
-DB_FILE = "dipper_bot.db"
+DB_FILE = "./data/dipper_bot.db"
 _conn = None  # persistent connection
 
 
@@ -54,7 +56,16 @@ def row_to_thread(row) -> ThreadRecord:
 # --------------------
 # Checklist Functions
 # --------------------
-def save_checklist(obs: Observation):
+def save_checklist(obs: Observation, lat: float | None = None, lon: float | None = None):
+    """
+    Save checklist and convert to UTC if lat/lon provided.
+
+    If lat/lon are given, obs.obs_datetime is assumed naive in local eBird time
+    and will be converted to UTC automatically.
+    """
+    if lat is not None and lon is not None:
+        obs.obs_datetime = ebird_local_to_utc(obs.obs_datetime.strftime("%Y-%m-%d %H:%M"), lat, lon)
+
     conn = get_connection()
     with conn:
         conn.execute("""
@@ -162,3 +173,43 @@ def row_to_missed(row) -> MissedObservation:
         missed_at=datetime.fromisoformat(row["missed_at"]),
         thread_tracker_key=row["thread_tracker_key"]
     )
+
+
+# --------------------
+# Utilities
+# --------------------
+def get_all_county_regions():
+    """
+    Returns a list of dicts: [{"code": "US-CO-013", "name": "El Paso"}, ...]
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT code, name FROM regions WHERE code LIKE 'US-CO-%'")
+    rows = cur.fetchall()
+    conn.close()
+    return [{"code": r[0], "name": r[1]} for r in rows]
+
+
+def close_connection():
+    global _conn
+    if _conn is not None:
+        _conn.close()
+        _conn = None
+
+
+def get_checklist(checklist_id: str) -> Observation | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM checklists WHERE checklist_id=?", (checklist_id,)).fetchone()
+    return row_to_observation(row) if row else None
+
+
+def get_all_threads() -> list[ThreadRecord]:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM threads").fetchall()
+    return [row_to_thread(r) for r in rows]
+
+
+def delete_thread(tracker_key: str):
+    conn = get_connection()
+    with conn:
+        conn.execute("DELETE FROM threads WHERE tracker_key=?", (tracker_key,))

@@ -1,3 +1,6 @@
+# db_schema.py
+import sqlite3
+
 # Threads table
 THREADS_TABLE = """
 CREATE TABLE IF NOT EXISTS threads (
@@ -55,3 +58,12 @@ def init_db(connection):
         connection.execute(CHECKLISTS_TABLE)
         connection.execute(MODERATION_QUEUE_TABLE)
         connection.execute(MISSES_TABLE)
+
+# Run when executed directly
+if __name__ == "__main__":
+    db_file = "dipper_bot.db"
+    conn = sqlite3.connect(db_file)
+    print(f"Initializing database at {db_file}...")
+    init_db(conn)
+    conn.close()
+    print("Done.")

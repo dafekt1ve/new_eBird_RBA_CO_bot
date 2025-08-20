@@ -32,3 +32,6 @@ htmlcov/
 
 # Test output
 test_output/
+
+# Data folder
+data/
