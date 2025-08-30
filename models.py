@@ -25,18 +25,19 @@ class ThreadRecord:
 @dataclass
 class Observation:
     checklist_id: str
-    species: str
+    species: str               # normalized species name (no subspecies)
+    subspecies: str | None     # extracted subspecies name if present
     region: str
     location: str
     observer: str
     obs_datetime: datetime
     local_tz: str
     thread_tracker_key: str | None
-    lat: float | None = None
-    lon: float | None = None
+    lat: float | None
+    lon: float | None
     counted: bool = False
     has_media: bool = False
-    
+
 
 @dataclass
 class ChecklistModeration:
