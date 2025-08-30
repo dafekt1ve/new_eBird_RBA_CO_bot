@@ -62,45 +62,83 @@ def row_to_thread(row) -> ThreadRecord:
 # Checklist Functions
 # --------------------
 def save_checklist(obs: Observation, lat: float | None = None, lon: float | None = None):
-    """
-    Save checklist and convert to UTC if lat/lon provided.
-
-    If lat/lon are given, obs.obs_datetime is assumed naive in local eBird time
-    and will be converted to UTC automatically.
-    """
+    """Save checklist and convert to UTC if lat/lon provided."""
     if lat is not None and lon is not None:
         obs.obs_datetime = ebird_local_to_utc(obs.obs_datetime.strftime("%Y-%m-%d %H:%M"), lat, lon)
-
+    
     conn = get_connection()
     with conn:
         conn.execute("""
-            INSERT INTO checklists (checklist_id, species, region, observer, obs_datetime, thread_tracker_key)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO checklists (
+                checklist_id, species, subspecies, region, observer, obs_datetime, local_tz,
+                location, lat, lon, thread_tracker_key, counted, has_media
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(checklist_id) DO UPDATE SET
                 species=excluded.species,
+                subspecies=excluded.subspecies,
                 region=excluded.region,
                 observer=excluded.observer,
                 obs_datetime=excluded.obs_datetime,
-                thread_tracker_key=excluded.thread_tracker_key
-        """, (obs.checklist_id, obs.species, obs.region, obs.observer,
-              obs.obs_datetime.isoformat(), obs.thread_tracker_key))
+                local_tz=excluded.local_tz,
+                location=excluded.location,
+                lat=excluded.lat,
+                lon=excluded.lon,
+                thread_tracker_key=excluded.thread_tracker_key,
+                counted=excluded.counted,
+                has_media=excluded.has_media
+        """, (
+            obs.checklist_id,
+            obs.species,
+            obs.subspecies or '',  # Use empty string if subspecies is None
+            obs.region,
+            obs.observer,
+            obs.obs_datetime.isoformat(),
+            obs.local_tz,
+            obs.location,
+            obs.lat,
+            obs.lon,
+            obs.thread_tracker_key,
+            obs.counted,
+            obs.has_media
+        ))
 
 
 def get_checklists_for_thread(tracker_key: str) -> list[Observation]:
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM checklists WHERE thread_tracker_key=?", (tracker_key,)).fetchall()
+    rows = conn.execute("""
+        SELECT checklist_id, species, subspecies, region, observer, obs_datetime, local_tz,
+               location, lat, lon, thread_tracker_key, counted, has_media
+        FROM checklists
+        WHERE thread_tracker_key = ?
+    """, (tracker_key,)).fetchall()
+    
     return [row_to_observation(r) for r in rows]
-
 
 def row_to_observation(row) -> Observation:
     return Observation(
         checklist_id=row["checklist_id"],
         species=row["species"],
+        subspecies=row["subspecies"] or None,  # Convert empty string to None
         region=row["region"],
         observer=row["observer"],
         obs_datetime=datetime.fromisoformat(row["obs_datetime"]),
-        thread_tracker_key=row["thread_tracker_key"]
+        local_tz=row["local_tz"],
+        location=row["location"],
+        lat=row["lat"],
+        lon=row["lon"],
+        thread_tracker_key=row["thread_tracker_key"],
+        counted=row["counted"],
+        has_media=row["has_media"]
     )
+
+def add_subspecies_column_if_missing():
+    conn = get_connection()
+    conn.execute("""
+        PRAGMA foreign_keys=off;
+        ALTER TABLE checklists ADD COLUMN subspecies TEXT;
+        PRAGMA foreign_keys=on;
+    """)
+    conn.commit()
 
 
 # --------------------

@@ -23,6 +23,7 @@ CHECKLISTS_TABLE = """
 CREATE TABLE IF NOT EXISTS checklists (
     checklist_id TEXT PRIMARY KEY,
     species TEXT NOT NULL,
+    subspecies TEXT,
     region TEXT NOT NULL,
     observer TEXT,
     obs_datetime TEXT NOT NULL,
