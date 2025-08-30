@@ -1,12 +1,17 @@
 # discord_moderation.py
 import discord
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict
 from models import ModerationEntry, ModerationStatus
 from moderation_utils import (
     update_moderation_entry_status, 
     update_discord_message_id,
     get_moderation_entry
+)
+from clustering_utils import (
+    cluster_moderation_entries, 
+    get_cluster_representative,
+    should_cluster_for_moderation
 )
 from db import save_checklist, save_thread
 from models import Observation, ThreadRecord, ThreadType
@@ -159,8 +164,108 @@ class ModerationView(discord.ui.View):
             logger.error(f"Error creating forum thread: {e}")
 
 
+class ClusterModerationView(discord.ui.View):
+    """Discord View for cluster moderation with Accept All/Reject All buttons."""
+    
+    def __init__(self, cluster_id: str, entries: List[ModerationEntry]):
+        super().__init__(timeout=None)
+        self.cluster_id = cluster_id
+        self.entries = entries
+        self.species = entries[0].species if entries else "Unknown"
+
+    @discord.ui.button(label='Accept All', style=discord.ButtonStyle.green, emoji='✅')
+    async def accept_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_cluster_moderation(interaction, ModerationStatus.ACCEPTED)
+
+    @discord.ui.button(label='Reject All', style=discord.ButtonStyle.red, emoji='❌')
+    async def reject_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_cluster_moderation(interaction, ModerationStatus.REJECTED)
+
+    async def handle_cluster_moderation(self, interaction: discord.Interaction, action: ModerationStatus):
+        """Handle cluster-wide accept/reject decisions."""
+        
+        # Check if user has moderator role
+        if not any(role.name.lower() == 'moderator' for role in interaction.user.roles):
+            await interaction.response.send_message("You don't have permission to moderate.", ephemeral=True)
+            return
+
+        try:
+            processed_count = 0
+            failed_count = 0
+            
+            for entry in self.entries:
+                # Skip if already processed
+                if entry.status != ModerationStatus.PENDING:
+                    continue
+                
+                # Update the moderation status
+                success = update_moderation_entry_status(
+                    entry.checklist_id, 
+                    entry.species, 
+                    action, 
+                    str(interaction.user.id),
+                    datetime.now(),
+                    str(interaction.message.id)
+                )
+                
+                if success:
+                    processed_count += 1
+                    # If accepted, handle the acceptance workflow
+                    if action == ModerationStatus.ACCEPTED:
+                        await self.handle_entry_acceptance(entry, interaction)
+                else:
+                    failed_count += 1
+
+            # Disable buttons and update message
+            for item in self.children:
+                item.disabled = True
+
+            action_word = "accepted" if action == ModerationStatus.ACCEPTED else "rejected"
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.green() if action == ModerationStatus.ACCEPTED else discord.Color.red()
+            
+            status_text = f"Cluster {action_word} by {interaction.user.mention} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            if failed_count > 0:
+                status_text += f"\n⚠️ {failed_count} entries failed to update"
+            
+            embed.add_field(name="Moderation Decision", value=status_text, inline=False)
+
+            await interaction.response.edit_message(embed=embed, view=self)
+            
+            logger.info(f"Cluster moderation {action.value}: {self.species} cluster {self.cluster_id} - {processed_count} processed, {failed_count} failed")
+
+        except Exception as e:
+            logger.error(f"Error handling cluster moderation: {e}")
+            await interaction.response.send_message("An error occurred while processing the cluster.", ephemeral=True)
+
+    async def handle_entry_acceptance(self, entry: ModerationEntry, interaction: discord.Interaction):
+        """Handle acceptance for a single entry in the cluster."""
+        try:
+            # Convert to observation and save
+            obs = Observation(
+                checklist_id=entry.checklist_id,
+                species=entry.species,
+                subspecies=None,
+                region=entry.region,
+                location=entry.location or "Unknown",
+                observer=entry.observer or "Unknown",
+                obs_datetime=entry.obs_datetime,
+                local_tz=entry.local_tz,
+                thread_tracker_key=f"{entry.species}|{entry.region}",
+                lat=entry.lat,
+                lon=entry.lon,
+                counted=False,
+                has_media=entry.has_media
+            )
+            
+            save_checklist(obs)
+            
+        except Exception as e:
+            logger.error(f"Error handling entry acceptance in cluster: {e}")
+
+
 def create_moderation_embed(entry: ModerationEntry) -> discord.Embed:
-    """Create a Discord embed for a moderation entry."""
+    """Create a Discord embed for a single moderation entry."""
     
     # Create embed with species info
     embed = discord.Embed(
@@ -191,11 +296,96 @@ def create_moderation_embed(entry: ModerationEntry) -> discord.Embed:
     return embed
 
 
-async def send_moderation_request(channel: discord.TextChannel, entry: ModerationEntry) -> Optional[discord.Message]:
+def create_cluster_moderation_embed(cluster_id: str, entries: List[ModerationEntry]) -> discord.Embed:
+    """Create a Discord embed for clustered moderation entries."""
+    
+    if not entries:
+        raise ValueError("entries list cannot be empty")
+    
+    representative = entries[0]  # Should use clustering logic to get best representative
+    species = representative.species
+    
+    # Create embed with cluster info
+    embed = discord.Embed(
+        title=f"🔍 Clustered Species Review",
+        description=f"**{species}** ({len(entries)} reports)",
+        color=discord.Color.orange(),
+        timestamp=representative.submitted_at
+    )
+
+    # Add cluster summary
+    locations = list(set([e.location for e in entries if e.location]))[:3]
+    location_text = ", ".join(locations[:2])
+    if len(locations) > 2:
+        location_text += f", and {len(locations)-2} more"
+    
+    embed.add_field(name="Locations", value=location_text or "Various", inline=True)
+    embed.add_field(name="Reports", value=str(len(entries)), inline=True)
+    embed.add_field(name="Region", value=representative.region, inline=True)
+
+    # Add representative observation details
+    obs_time_str = representative.obs_datetime.strftime("%Y-%m-%d %H:%M")
+    embed.add_field(name="First Report", value=f"{obs_time_str} by {representative.observer}", inline=False)
+    
+    # Add map link if coordinates available
+    if representative.lat and representative.lon:
+        map_url = f"https://www.google.com/maps/search/?api=1&query={representative.lat},{representative.lon}"
+        embed.add_field(name="Location", value=f"[View on Map]({map_url})", inline=True)
+
+    # Add media indicator
+    media_count = sum(1 for e in entries if e.has_media)
+    if media_count > 0:
+        embed.add_field(name="Media", value=f"{media_count}/{len(entries)} with media", inline=True)
+
+    # Add eBird link for representative
+    ebird_url = f"https://ebird.org/checklist/{representative.checklist_id}"
+    embed.add_field(name="Representative Checklist", value=f"[View eBird]({ebird_url})", inline=True)
+
+    # Add footer
+    embed.set_footer(text="This is a cluster of nearby reports. Accept All to add to RBA or Reject All to dismiss.")
+
+    return embed
+
+
+async def send_moderation_requests(channel: discord.TextChannel, entries: List[ModerationEntry]) -> int:
     """
-    Send a moderation request message to the specified channel.
-    Returns the sent message or None if failed.
+    Send moderation requests for entries, using clustering when appropriate.
+    Returns the number of successfully sent requests.
     """
+    if not entries:
+        return 0
+    
+    sent_count = 0
+    
+    # Determine if we should use clustering
+    if should_cluster_for_moderation(entries):
+        logger.info(f"Clustering {len(entries)} moderation entries")
+        clusters = cluster_moderation_entries(entries, threshold_km=2)
+        
+        for cluster_id, cluster_entries in clusters.items():
+            if len(cluster_entries) == 1:
+                # Single entry - use individual moderation
+                entry = cluster_entries[0]
+                message = await send_individual_moderation_request(channel, entry)
+                if message:
+                    sent_count += 1
+            else:
+                # Multiple entries - use cluster moderation
+                message = await send_cluster_moderation_request(channel, cluster_id, cluster_entries)
+                if message:
+                    sent_count += 1
+    else:
+        # No clustering needed - send individual requests
+        for entry in entries:
+            message = await send_individual_moderation_request(channel, entry)
+            if message:
+                sent_count += 1
+    
+    return sent_count
+
+
+async def send_individual_moderation_request(channel: discord.TextChannel, entry: ModerationEntry) -> Optional[discord.Message]:
+    """Send a moderation request for a single entry."""
     try:
         embed = create_moderation_embed(entry)
         view = ModerationView(entry.checklist_id, entry.species)
@@ -208,23 +398,24 @@ async def send_moderation_request(channel: discord.TextChannel, entry: Moderatio
         return message
         
     except Exception as e:
-        logger.error(f"Failed to send moderation request: {e}")
+        logger.error(f"Failed to send individual moderation request: {e}")
         return None
 
 
-async def send_moderation_requests(channel: discord.TextChannel, entries: List[ModerationEntry]) -> int:
-    """
-    Send moderation requests for multiple entries.
-    Returns the number of successfully sent requests.
-    """
-    sent_count = 0
-    
-    for entry in entries:
-        message = await send_moderation_request(channel, entry)
-        if message:
-            sent_count += 1
-            logger.info(f"Sent moderation request for {entry.species} in {entry.checklist_id}")
-        else:
-            logger.error(f"Failed to send moderation request for {entry.species} in {entry.checklist_id}")
-    
-    return sent_count
+async def send_cluster_moderation_request(channel: discord.TextChannel, cluster_id: str, entries: List[ModerationEntry]) -> Optional[discord.Message]:
+    """Send a moderation request for a cluster of entries."""
+    try:
+        embed = create_cluster_moderation_embed(cluster_id, entries)
+        view = ClusterModerationView(cluster_id, entries)
+        
+        message = await channel.send(embed=embed, view=view)
+        
+        # Update all entries in the cluster with the Discord message ID
+        for entry in entries:
+            update_discord_message_id(entry.checklist_id, entry.species, str(message.id))
+        
+        return message
+        
+    except Exception as e:
+        logger.error(f"Failed to send cluster moderation request: {e}")
+        return None
