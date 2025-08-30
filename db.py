@@ -2,7 +2,7 @@
 import sqlite3
 from datetime import datetime
 from db_schema import init_db
-from models import ThreadRecord, Observation, ChecklistModeration, MissedObservation, ModerationStatus
+from models import ThreadRecord, Observation, ChecklistModeration, MissedObservation, ModerationStatus, ModerationEntry
 from time_utils import ebird_local_to_utc
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
@@ -72,7 +72,7 @@ def save_checklist(obs: Observation, lat: float | None = None, lon: float | None
             INSERT INTO checklists (
                 checklist_id, species, subspecies, region, observer, obs_datetime, local_tz,
                 location, lat, lon, thread_tracker_key, counted, has_media
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(checklist_id) DO UPDATE SET
                 species=excluded.species,
                 subspecies=excluded.subspecies,
@@ -142,7 +142,160 @@ def add_subspecies_column_if_missing():
 
 
 # --------------------
-# Moderation Queue Functions
+# Enhanced Moderation Queue Functions
+# --------------------
+def save_moderation_entry(entry: ModerationEntry) -> int:
+    """Save a moderation entry to database. Returns the entry ID."""
+    conn = get_connection()
+    with conn:
+        cursor = conn.execute("""
+            INSERT INTO moderation_queue (
+                checklist_id, species, region, observer, location, obs_datetime, 
+                local_tz, lat, lon, has_media, submitted_at, status, 
+                moderated_by, moderated_at, discord_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(checklist_id, species) DO UPDATE SET
+                observer=excluded.observer,
+                location=excluded.location,
+                obs_datetime=excluded.obs_datetime,
+                local_tz=excluded.local_tz,
+                lat=excluded.lat,
+                lon=excluded.lon,
+                has_media=excluded.has_media,
+                submitted_at=excluded.submitted_at
+        """, (
+            entry.checklist_id, entry.species, entry.region, entry.observer,
+            entry.location, entry.obs_datetime.isoformat(), entry.local_tz,
+            entry.lat, entry.lon, entry.has_media, entry.submitted_at.isoformat(),
+            entry.status.value, entry.moderated_by, 
+            entry.moderated_at.isoformat() if entry.moderated_at else None,
+            entry.discord_message_id
+        ))
+        return cursor.lastrowid
+
+
+def get_moderation_entry_by_composite(checklist_id: str, species: str) -> Optional[ModerationEntry]:
+    """Get a moderation entry by checklist_id and species."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT id, checklist_id, species, region, observer, location, obs_datetime,
+               local_tz, lat, lon, has_media, submitted_at, status, moderated_by, 
+               moderated_at, discord_message_id
+        FROM moderation_queue 
+        WHERE checklist_id = ? AND species = ?
+    """, (checklist_id, species)).fetchone()
+    
+    if row:
+        return ModerationEntry(
+            id=row["id"],
+            checklist_id=row["checklist_id"],
+            species=row["species"],
+            region=row["region"],
+            observer=row["observer"],
+            location=row["location"],
+            obs_datetime=datetime.fromisoformat(row["obs_datetime"]),
+            local_tz=row["local_tz"],
+            lat=row["lat"],
+            lon=row["lon"],
+            has_media=row["has_media"],
+            submitted_at=datetime.fromisoformat(row["submitted_at"]),
+            status=ModerationStatus(row["status"]),
+            moderated_by=row["moderated_by"],
+            moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
+            discord_message_id=row["discord_message_id"]
+        )
+    return None
+
+
+def get_pending_moderation_entries() -> List[ModerationEntry]:
+    """Get all pending moderation entries."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT id, checklist_id, species, region, observer, location, obs_datetime,
+               local_tz, lat, lon, has_media, submitted_at, status, moderated_by, 
+               moderated_at, discord_message_id
+        FROM moderation_queue 
+        WHERE status = 'pending'
+        ORDER BY submitted_at ASC
+    """).fetchall()
+    
+    entries = []
+    for row in rows:
+        entries.append(ModerationEntry(
+            id=row["id"],
+            checklist_id=row["checklist_id"],
+            species=row["species"],
+            region=row["region"],
+            observer=row["observer"],
+            location=row["location"],
+            obs_datetime=datetime.fromisoformat(row["obs_datetime"]),
+            local_tz=row["local_tz"],
+            lat=row["lat"],
+            lon=row["lon"],
+            has_media=row["has_media"],
+            submitted_at=datetime.fromisoformat(row["submitted_at"]),
+            status=ModerationStatus(row["status"]),
+            moderated_by=row["moderated_by"],
+            moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
+            discord_message_id=row["discord_message_id"]
+        ))
+    
+    return entries
+
+
+def update_moderation_entry_status_by_composite(
+    checklist_id: str, 
+    species: str, 
+    new_status: ModerationStatus, 
+    moderated_by: str,
+    moderated_at: Optional[datetime] = None,
+    discord_message_id: Optional[str] = None
+) -> bool:
+    """Update the status of a moderation entry by checklist_id and species."""
+    if moderated_at is None:
+        moderated_at = datetime.now()
+    
+    conn = get_connection()
+    with conn:
+        cursor = conn.execute("""
+            UPDATE moderation_queue 
+            SET status = ?, moderated_by = ?, moderated_at = ?, discord_message_id = ?
+            WHERE checklist_id = ? AND species = ?
+        """, (
+            new_status.value, moderated_by, moderated_at.isoformat(),
+            discord_message_id, checklist_id, species
+        ))
+        return cursor.rowcount > 0
+
+
+def update_discord_message_id_by_composite(checklist_id: str, species: str, message_id: str) -> bool:
+    """Update the Discord message ID for a moderation entry."""
+    conn = get_connection()
+    with conn:
+        cursor = conn.execute("""
+            UPDATE moderation_queue 
+            SET discord_message_id = ?
+            WHERE checklist_id = ? AND species = ?
+        """, (message_id, checklist_id, species))
+        return cursor.rowcount > 0
+
+
+def is_already_processed_by_composite(checklist_id: str, species: str) -> bool:
+    """Check if this checklist+species combo has already been processed."""
+    conn = get_connection()
+    result = conn.execute("""
+        SELECT status FROM moderation_queue 
+        WHERE checklist_id = ? AND species = ?
+    """, (checklist_id, species)).fetchone()
+    
+    if result:
+        status = result["status"]
+        return status in ['accepted', 'rejected']
+    return False
+
+
+# --------------------
+# Legacy Moderation Queue Functions (for backward compatibility)
 # --------------------
 def save_pending_checklist(mod: ChecklistModeration):
     conn = get_connection()
@@ -151,15 +304,11 @@ def save_pending_checklist(mod: ChecklistModeration):
             INSERT INTO moderation_queue
                 (checklist_id, species, region, submitted_by, submitted_at, status, moderated_by, moderated_at, merge_target_thread)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(checklist_id) DO UPDATE SET
-                species=excluded.species,
+            ON CONFLICT(checklist_id, species) DO UPDATE SET
                 region=excluded.region,
-                submitted_by=excluded.submitted_by,
-                submitted_at=excluded.submitted_at,
                 status=excluded.status,
                 moderated_by=excluded.moderated_by,
-                moderated_at=excluded.moderated_at,
-                merge_target_thread=excluded.merge_target_thread
+                moderated_at=excluded.moderated_at
         """, (
             mod.checklist_id,
             mod.species,
@@ -173,12 +322,14 @@ def save_pending_checklist(mod: ChecklistModeration):
         ))
 
 def get_moderation_entry(checklist_id: str) -> ChecklistModeration | None:
+    """Legacy function - gets first moderation entry for a checklist."""
     conn = get_connection()
     row = conn.execute("""
-        SELECT checklist_id, species, region, submitted_by, submitted_at, status,
-               moderated_by, moderated_at, merge_target_thread
+        SELECT checklist_id, species, region, observer, submitted_at, status,
+               moderated_by, moderated_at
         FROM moderation_queue
         WHERE checklist_id = ?
+        LIMIT 1
     """, (checklist_id,)).fetchone()
 
     if row:
@@ -186,19 +337,20 @@ def get_moderation_entry(checklist_id: str) -> ChecklistModeration | None:
             checklist_id=row["checklist_id"],
             species=row["species"],
             region=row["region"],
-            submitted_by=row["submitted_by"],
+            submitted_by=row["observer"],
             submitted_at=datetime.fromisoformat(row["submitted_at"]),
             status=ModerationStatus(row["status"]),
             moderated_by=row["moderated_by"],
             moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
-            merge_target_thread=row["merge_target_thread"]
+            merge_target_thread=None
         )
     return None
 
 def update_moderation_status(checklist_id, status, moderated_by=None, moderated_at=None, conn=None):
+    """Legacy function for backward compatibility."""
     own_conn = False
     if conn is None:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         own_conn = True
 
     with conn:
@@ -215,21 +367,36 @@ def update_moderation_status(checklist_id, status, moderated_by=None, moderated_
 
 
 def get_pending_moderation() -> list[ChecklistModeration]:
+    """Legacy function - returns ChecklistModeration objects for backward compatibility."""
     conn = get_connection()
     rows = conn.execute("SELECT * FROM moderation_queue WHERE status='pending'").fetchall()
-    return [row_to_moderation(r) for r in rows]
+    results = []
+    for row in rows:
+        results.append(ChecklistModeration(
+            checklist_id=row["checklist_id"],
+            species=row["species"],
+            region=row["region"],
+            submitted_by=row["observer"],
+            submitted_at=datetime.fromisoformat(row["submitted_at"]),
+            status=ModerationStatus(row["status"]),
+            moderated_by=row["moderated_by"],
+            moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
+            merge_target_thread=None
+        ))
+    return results
 
 def row_to_moderation(row) -> ChecklistModeration:
+    """Legacy function for backward compatibility."""
     return ChecklistModeration(
         checklist_id=row["checklist_id"],
         species=row["species"],
         region=row["region"],
-        submitted_by=row["submitted_by"],
+        submitted_by=row["observer"],
         submitted_at=datetime.fromisoformat(row["submitted_at"]),
         status=ModerationStatus(row["status"]),
         moderated_by=row["moderated_by"],
         moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
-        merge_target_thread=row["merge_target_thread"]
+        merge_target_thread=None
     )
 
 # --------------------

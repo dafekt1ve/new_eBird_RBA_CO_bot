@@ -40,7 +40,29 @@ class Observation:
 
 
 @dataclass
+class ModerationEntry:
+    """Enhanced moderation entry with full checklist data."""
+    id: int
+    checklist_id: str
+    species: str
+    region: str
+    observer: str | None
+    location: str | None
+    obs_datetime: datetime
+    local_tz: str
+    lat: float | None
+    lon: float | None
+    has_media: bool
+    submitted_at: datetime
+    status: ModerationStatus
+    moderated_by: str | None = None
+    moderated_at: datetime | None = None
+    discord_message_id: str | None = None
+
+
+@dataclass
 class ChecklistModeration:
+    """Legacy moderation class for backward compatibility."""
     checklist_id: str
     species: str
     region: str
@@ -50,6 +72,7 @@ class ChecklistModeration:
     moderated_by: str | None
     moderated_at: datetime | None = None
     merge_target_thread: str | None = None
+
 
 @dataclass
 class MissedObservation:

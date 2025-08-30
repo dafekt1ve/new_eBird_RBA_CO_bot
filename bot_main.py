@@ -1,3 +1,4 @@
+# bot_main.py
 import os
 from ebird_api import fetch_ebird_rba
 import discord
@@ -11,7 +12,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from models import Observation
 from co_county_lookup import lookup_region_code
-from tasks import build_region_channels_map, rba_task
+from tasks import build_region_channels_map, rba_task, moderation_task
+from discord_moderation import ModerationView
 from discord.ext import commands
 import logging
 import requests
@@ -119,6 +121,7 @@ async def on_ready():
         bot.codesList.append(species)
     f.close()
 
+    # Load Colorado Review List
     with open("CO_Review_List.txt", "r") as f:
         review_dict = json.load(f)
 
@@ -128,10 +131,16 @@ async def on_ready():
         save_review_species(species, flag == "True")
         conn.close()
 
+    # Add persistent views for moderation buttons
+    bot.add_view(ModerationView("", ""))  # Placeholder - actual instances will be created dynamically
 
     # Start the scheduled RBA loop
     if not scheduled_rba.is_running():
         scheduled_rba.start()
+    
+    # Start the moderation task loop
+    if not moderation_loop.is_running():
+        moderation_loop.start()
 
 
 async def handle_rba_command(channel, region_code: str):
@@ -161,6 +170,7 @@ async def handle_rba_command(channel, region_code: str):
         obs = Observation(
             checklist_id=d.get("subId"),
             species=d.get("comName"),
+            subspecies=None,  # Will be extracted by mappers if needed
             region=region_code,
             location=d.get("locName", "Unknown"),
             observer=d.get("userDisplayName", "Unknown"),
@@ -178,31 +188,6 @@ async def handle_rba_command(channel, region_code: str):
     for msg in messages:
         await channel.send(msg, silent=True)
 
-
-async def scheduled_rba_fetch():
-    for region in REGION_CODES:
-        recent_obs = fetch_ebird_rba(region)
-        for obs in recent_obs:
-            obs.obs_datetime = ebird_local_to_utc(obs.obs_datetime, obs.lat, obs.lon)
-            save_checklist(obs)
-        await update_threads_for_region(region_code)
-        # Optionally notify moderators or log
-
-def identify_pending_moderation():
-    return get_pending_moderation()  # from db.py
-
-async def send_to_moderators(mod_list):
-    for mod_item in mod_list:
-        # send Discord message with accept/reject buttons
-        pass
-
-async def handle_moderation_action(checklist_id, action, moderator):
-    if action == "accept":
-        # create thread in Discord
-        # save_thread in db
-        update_moderation_status(checklist_id, "accepted", moderator)
-    elif action == "reject":
-        update_moderation_status(checklist_id, "rejected", moderator)
 
 def compute_recency(thread_tracker_key: str) -> str:
     """Compute recency bucket based on the most recent checklist in UTC."""
@@ -265,6 +250,16 @@ async def before_scheduled_rba():
     await bot.wait_until_ready()
     guild = bot.get_guild(int(GUILD_ID))
     region_channels = await build_region_channels_map(guild)
+
+# New moderation task loop - runs every 10 minutes
+@tasks.loop(minutes=10)
+async def moderation_loop():
+    await moderation_task(bot, GUILD_ID)
+
+@moderation_loop.before_loop
+async def before_moderation_loop():
+    await bot.wait_until_ready()
+    logger.info("Starting moderation task loop (every 10 minutes)")
 
 @bot.command()
 async def rba(ctx, *arg):
@@ -341,5 +336,23 @@ async def getBC(ctx, *arg):
         await ctx.send('No matching species found.')
     else:
         await ctx.send(str(speciesCodes[0]).replace('[', '').replace(']','').replace("'",""))
+
+# Admin command to manually trigger moderation check
+@bot.command()
+@commands.has_role('Moderator')
+async def check_moderation(ctx):
+    """Manually trigger a moderation check."""
+    logger.info(f"Manual moderation check requested by {ctx.author.name}")
+    await ctx.send("Starting manual moderation check...")
+    
+    try:
+        sent_count = await moderation_task(bot, GUILD_ID)
+        if sent_count > 0:
+            await ctx.send(f"✅ Sent {sent_count} new moderation requests.")
+        else:
+            await ctx.send("✅ No new moderation requests needed.")
+    except Exception as e:
+        logger.error(f"Manual moderation check failed: {e}")
+        await ctx.send(f"❌ Error during moderation check: {str(e)}")
 
 bot.run(TOKEN)

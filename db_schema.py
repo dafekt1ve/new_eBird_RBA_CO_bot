@@ -38,18 +38,26 @@ CREATE TABLE IF NOT EXISTS checklists (
 );
 """
 
-# Moderation queue table
+# Updated moderation queue table with composite key support
 MODERATION_QUEUE_TABLE = """
 CREATE TABLE IF NOT EXISTS moderation_queue (
-    checklist_id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id TEXT NOT NULL,
     species TEXT NOT NULL,
     region TEXT NOT NULL,
-    submitted_by TEXT,
+    observer TEXT,
+    location TEXT,
+    obs_datetime TEXT NOT NULL,
+    local_tz TEXT DEFAULT 'UTC',
+    lat TEXT,
+    lon TEXT,
+    has_media BOOLEAN DEFAULT FALSE,
     submitted_at TEXT DEFAULT CURRENT_TIMESTAMP,
     status TEXT CHECK(status IN ('pending','accepted','rejected')) DEFAULT 'pending',
     moderated_by TEXT,
     moderated_at TEXT,
-    merge_target_thread TEXT
+    discord_message_id TEXT,
+    UNIQUE(checklist_id, species)
 );
 """
 

@@ -1,4 +1,4 @@
-#tasks.py
+# tasks.py
 import discord
 import os
 from db import save_checklist, get_all_county_regions
@@ -6,6 +6,7 @@ from ebird_api import fetch_ebird_rba
 from rba_formatter import chunked_rba_messages
 from time_utils import ebird_local_to_utc, get_timezone_name
 from models import Observation, ChecklistModeration, ModerationStatus
+from rare_species_task import rare_species_moderation_task
 import logging
 from discord.utils import get
 
@@ -61,6 +62,7 @@ async def rba_task(region_channels: dict):
                 obs = Observation(
                     checklist_id=d.get("subId"),
                     species=d.get("comName"),
+                    subspecies=None,  # Will be extracted by mappers if needed
                     region=region_code,
                     location=d.get("locName", "Unknown"),
                     observer=d.get("userDisplayName", "Unknown"),
@@ -86,3 +88,23 @@ async def rba_task(region_channels: dict):
 
         except Exception as e:
             logger.error(f"[RBA] Error processing region {region_code}: {e}")
+
+
+async def moderation_task(bot: discord.Client, guild_id: int):
+    """
+    Task to check for rare species requiring moderation.
+    This should be called every 10 minutes.
+    """
+    try:
+        logger.info("[MODERATION] Starting rare species check")
+        
+        # Run the rare species moderation task for Colorado
+        sent_count = await rare_species_moderation_task(bot, guild_id, "US-CO")
+        
+        if sent_count > 0:
+            logger.info(f"[MODERATION] Sent {sent_count} new moderation requests")
+        else:
+            logger.debug("[MODERATION] No new moderation requests needed")
+            
+    except Exception as e:
+        logger.error(f"[MODERATION] Error in moderation task: {e}")
