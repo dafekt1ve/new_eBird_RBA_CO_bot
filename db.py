@@ -2,10 +2,15 @@
 import sqlite3
 from datetime import datetime
 from db_schema import init_db
-from models import ThreadRecord, Observation, ChecklistModeration, MissedObservation
-from time_utils import ebird_local_to_utc  # <-- new
+from models import ThreadRecord, Observation, ChecklistModeration, MissedObservation, ModerationStatus
+from time_utils import ebird_local_to_utc
+from typing import Optional, List, Tuple
+from dotenv import load_dotenv
+import os
 
-DB_FILE = "./data/dipper_bot.db"
+load_dotenv()
+DB_FILE = os.getenv("DB_FILE")
+DB_PATH =  f"./data/{DB_FILE}"
 _conn = None  # persistent connection
 
 
@@ -13,7 +18,7 @@ def get_connection():
     """Return a persistent SQLite connection, initializing tables if needed."""
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES)
+        _conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
         _conn.row_factory = sqlite3.Row
         init_db(_conn)
     return _conn
@@ -105,34 +110,76 @@ def save_pending_checklist(mod: ChecklistModeration):
     conn = get_connection()
     with conn:
         conn.execute("""
-            INSERT INTO moderation_queue (checklist_id, species, region, submitted_by, submitted_at, status, moderated_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO moderation_queue
+                (checklist_id, species, region, submitted_by, submitted_at, status, moderated_by, moderated_at, merge_target_thread)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(checklist_id) DO UPDATE SET
                 species=excluded.species,
                 region=excluded.region,
                 submitted_by=excluded.submitted_by,
                 submitted_at=excluded.submitted_at,
                 status=excluded.status,
-                moderated_by=excluded.moderated_by
-        """, (mod.checklist_id, mod.species, mod.region, mod.submitted_by,
-              mod.submitted_at.isoformat(), mod.status, mod.moderated_by))
+                moderated_by=excluded.moderated_by,
+                moderated_at=excluded.moderated_at,
+                merge_target_thread=excluded.merge_target_thread
+        """, (
+            mod.checklist_id,
+            mod.species,
+            mod.region,
+            mod.submitted_by,
+            mod.submitted_at.isoformat(),
+            mod.status.value if isinstance(mod.status, ModerationStatus) else mod.status,
+            mod.moderated_by,
+            mod.moderated_at.isoformat() if mod.moderated_at else None,
+            mod.merge_target_thread
+        ))
+
+def get_moderation_entry(checklist_id: str) -> ChecklistModeration | None:
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT checklist_id, species, region, submitted_by, submitted_at, status,
+               moderated_by, moderated_at, merge_target_thread
+        FROM moderation_queue
+        WHERE checklist_id = ?
+    """, (checklist_id,)).fetchone()
+
+    if row:
+        return ChecklistModeration(
+            checklist_id=row["checklist_id"],
+            species=row["species"],
+            region=row["region"],
+            submitted_by=row["submitted_by"],
+            submitted_at=datetime.fromisoformat(row["submitted_at"]),
+            status=ModerationStatus(row["status"]),
+            moderated_by=row["moderated_by"],
+            moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
+            merge_target_thread=row["merge_target_thread"]
+        )
+    return None
+
+def update_moderation_status(checklist_id, status, moderated_by=None, moderated_at=None, conn=None):
+    own_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        own_conn = True
+
+    with conn:
+        conn.execute("""
+            UPDATE moderation_queue
+            SET status = ?,
+                moderated_by = ?,
+                moderated_at = ?
+            WHERE checklist_id = ?
+        """, (status, moderated_by, moderated_at.isoformat() if moderated_at else None, checklist_id))
+
+    if own_conn:
+        conn.close()
 
 
 def get_pending_moderation() -> list[ChecklistModeration]:
     conn = get_connection()
     rows = conn.execute("SELECT * FROM moderation_queue WHERE status='pending'").fetchall()
     return [row_to_moderation(r) for r in rows]
-
-
-def update_moderation_status(checklist_id: str, status: str, moderated_by: str):
-    conn = get_connection()
-    with conn:
-        conn.execute("""
-            UPDATE moderation_queue
-            SET status=?, moderated_by=?
-            WHERE checklist_id=?
-        """, (status, moderated_by, checklist_id))
-
 
 def row_to_moderation(row) -> ChecklistModeration:
     return ChecklistModeration(
@@ -141,10 +188,11 @@ def row_to_moderation(row) -> ChecklistModeration:
         region=row["region"],
         submitted_by=row["submitted_by"],
         submitted_at=datetime.fromisoformat(row["submitted_at"]),
-        status=row["status"],
-        moderated_by=row["moderated_by"]
+        status=ModerationStatus(row["status"]),
+        moderated_by=row["moderated_by"],
+        moderated_at=datetime.fromisoformat(row["moderated_at"]) if row["moderated_at"] else None,
+        merge_target_thread=row["merge_target_thread"]
     )
-
 
 # --------------------
 # Missed Observations Functions
@@ -174,6 +222,29 @@ def row_to_missed(row) -> MissedObservation:
         thread_tracker_key=row["thread_tracker_key"]
     )
 
+# --------------------
+# State Review Functions
+# --------------------
+def save_review_species(species_name: str, review_flag: bool):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO state_review_species (species_name, review_flag) VALUES (?, ?)",
+            (species_name, int(review_flag))
+        )
+
+def load_review_species() -> List[Tuple[str, bool]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("SELECT species_name, review_flag FROM state_review_species")
+        return [(row[0], bool(row[1])) for row in cursor.fetchall()]
+
+def is_species_flagged(species_name: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT review_flag FROM state_review_species WHERE species_name = ?",
+            (species_name,)
+        )
+        row = cursor.fetchone()
+        return bool(row[0]) if row else False
 
 # --------------------
 # Utilities
@@ -182,7 +253,7 @@ def get_all_county_regions():
     """
     Returns a list of dicts: [{"code": "US-CO-013", "name": "El Paso"}, ...]
     """
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT code, name FROM regions WHERE code LIKE 'US-CO-%'")
     rows = cur.fetchall()

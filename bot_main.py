@@ -2,8 +2,9 @@ import os
 from ebird_api import fetch_ebird_rba
 import discord
 from discord.ext import tasks
-from discord_messages import chunked_rba_messages
-from db import save_checklist, get_all_threads, save_thread, get_checklists_for_thread
+from db_schema import init_db
+from rba_formatter import chunked_rba_messages
+from db import save_checklist, get_all_threads, save_thread, get_checklists_for_thread, save_review_species, init_db, save_review_species
 from time_utils import ebird_local_to_utc, get_timezone_name
 from datetime import datetime, timezone, timedelta, time
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from discord.ext import commands
 import logging
 import requests
 import json
+import sqlite3
 
 # Create a logger object
 logger = logging.getLogger("Dipper_RBA_Bot")
@@ -38,9 +40,14 @@ file_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
+# Prevent duplicate logs if other libraries also configure logging
+logger.propagate = False
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 EBIRD_TOKEN = os.getenv("EBIRD_TOKEN")
+DB_FILE = os.getenv("DB_FILE")
+DB_PATH = f"./data/{DB_FILE}"
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -104,7 +111,6 @@ async def on_ready():
     with open("taxonomy_snapshot.json", "w") as f:
         json.dump(data, f, indent=2)
 
-
     bot.codesList = []
     f = open("codesList.txt", "w")
     for d in data:
@@ -112,8 +118,16 @@ async def on_ready():
         f.write(f'{species}\n')
         bot.codesList.append(species)
     f.close()
-    
-    # logger.debug(bot.codesList)
+
+    with open("CO_Review_List.txt", "r") as f:
+        review_dict = json.load(f)
+
+    for species, flag in review_dict.items():
+        conn = sqlite3.connect(DB_PATH)
+        init_db(conn)  # make sure all tables exist
+        save_review_species(species, flag == "True")
+        conn.close()
+
 
     # Start the scheduled RBA loop
     if not scheduled_rba.is_running():
@@ -174,7 +188,6 @@ async def scheduled_rba_fetch():
         await update_threads_for_region(region_code)
         # Optionally notify moderators or log
 
-       
 def identify_pending_moderation():
     return get_pending_moderation()  # from db.py
 
@@ -238,7 +251,7 @@ async def update_threads_for_region(region_code: str, discord_client: discord.Cl
             except Exception as e:
                 print(f"Failed to update Discord thread {thread.thread_id}: {e}")
 
-@tasks.loop(time=[time(7, 0, tzinfo=MT), time(17, 0, tzinfo=MT)])
+@tasks.loop(time=[time(7, 0, tzinfo=MT), time(17, 3, tzinfo=MT)])
 async def scheduled_rba():
     global region_channels
     if region_channels:

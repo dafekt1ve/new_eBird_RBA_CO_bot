@@ -1,10 +1,18 @@
 #tasks.py
 import discord
+import os
 from db import save_checklist, get_all_county_regions
 from ebird_api import fetch_ebird_rba
-from discord_messages import chunked_rba_messages
+from rba_formatter import chunked_rba_messages
 from time_utils import ebird_local_to_utc, get_timezone_name
-from models import Observation
+from models import Observation, ChecklistModeration, ModerationStatus
+import logging
+from discord.utils import get
+
+logger = logging.getLogger("Dipper_RBA_Bot")
+
+STATEWIDE_CODE = "US-CO"
+STATEWIDE_CHANNEL = int(os.getenv("STATEWIDE_MOD_CHANNEL", 0))  # channel for mods
 
 async def build_region_channels_map(guild: discord.Guild):
     """
@@ -24,7 +32,7 @@ async def build_region_channels_map(guild: discord.Guild):
         if channel:
             region_channels[code] = channel
         else:
-            print(f"[RBA] No channel found for {county_name} ({code})")
+            logger.error(f"[RBA] No channel found for {county_name} ({code})")
 
     return region_channels
 
@@ -74,7 +82,7 @@ async def rba_task(region_channels: dict):
             for obs in recent_obs:
                 save_checklist(obs)
 
-            print(f"[RBA] Posted {len(recent_obs)} observations to {channel.name}")
+            logger.info(f"[RBA] Posted {len(recent_obs)} observations to {channel.name}")
 
         except Exception as e:
-            print(f"[RBA] Error processing region {region_code}: {e}")
+            logger.error(f"[RBA] Error processing region {region_code}: {e}")
