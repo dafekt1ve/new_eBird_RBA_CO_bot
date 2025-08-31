@@ -33,7 +33,7 @@ async def rare_species_moderation_task(bot: discord.Client, guild_id: int, regio
             return 0
             
         # Find moderation channel
-        moderation_channel = discord.utils.get(guild.channels, name="moderation")
+        moderation_channel = discord.utils.get(guild.channels, name="test-rba-moderation")
         if not moderation_channel:
             logger.error("Moderation channel not found")
             return 0
@@ -50,7 +50,50 @@ async def rare_species_moderation_task(bot: discord.Client, guild_id: int, regio
         observations = []
         for data in ebird_data:
             try:
-                obs = build_observation_from_ebird(data, region_code, convert_to_utc=True)
+                # We need to manually create observations since your build_observation_from_ebird
+                # is missing some required fields. Let's create them directly.
+                lat = data.get("lat")
+                lon = data.get("lng")
+                
+                # Get timezone info
+                try:
+                    from time_utils import get_timezone_name
+                    tz_name = get_timezone_name(lat, lon) if lat is not None and lon is not None else "UTC"
+                except Exception:
+                    tz_name = "UTC"
+
+                # Parse observation datetime
+                obs_datetime = None
+                if data.get("obsDt"):
+                    try:
+                        obs_datetime = datetime.strptime(data["obsDt"], "%Y-%m-%d %H:%M")
+                        # Convert to UTC
+                        if lat is not None and lon is not None:
+                            from time_utils import ebird_local_to_utc
+                            obs_datetime = ebird_local_to_utc(obs_datetime.strftime("%Y-%m-%d %H:%M"), lat, lon)
+                    except Exception as e:
+                        logger.error(f"Error parsing observation datetime: {e}")
+                        continue
+
+                # Split species and subspecies
+                from mappers import split_species_and_subspecies
+                species, subspecies = split_species_and_subspecies(data.get("comName", "Unknown"))
+
+                obs = Observation(
+                    checklist_id=data.get("subId"),
+                    species=species,
+                    subspecies=subspecies,
+                    region=region_code,
+                    location=data.get("locName", "Unknown"),
+                    observer=data.get("userDisplayName", "Unknown"),
+                    obs_datetime=obs_datetime or datetime.now(),
+                    local_tz=tz_name,
+                    thread_tracker_key=f"{species}|{region_code}",
+                    lat=lat,
+                    lon=lon,
+                    counted=data.get("howMany", 0) > 0,
+                    has_media=bool(data.get("hasRichMedia", False))
+                )
                 observations.append(obs)
             except Exception as e:
                 logger.error(f"Error building observation from eBird data: {e}")
@@ -104,7 +147,7 @@ async def process_single_checklist_for_moderation(bot: discord.Client, guild_id:
             return 0
             
         # Find moderation channel
-        moderation_channel = discord.utils.get(guild.channels, name="moderation")
+        moderation_channel = discord.utils.get(guild.channels, name="test-rba-moderation")
         if not moderation_channel:
             logger.error("Moderation channel not found")
             return 0

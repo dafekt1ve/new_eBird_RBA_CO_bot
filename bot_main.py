@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from models import Observation
 from co_county_lookup import lookup_region_code
 from tasks import build_region_channels_map, rba_task, moderation_task
-from discord_moderation import ModerationView
 from discord.ext import commands
 import logging
 import requests
@@ -131,8 +130,8 @@ async def on_ready():
         save_review_species(species, flag == "True")
         conn.close()
 
-    # Add persistent views for moderation buttons
-    bot.add_view(ModerationView("", ""))  # Placeholder - actual instances will be created dynamically
+    # Note: Persistent views for moderation will be registered when first created
+    # This avoids initialization issues during startup
 
     # Start the scheduled RBA loop
     if not scheduled_rba.is_running():
