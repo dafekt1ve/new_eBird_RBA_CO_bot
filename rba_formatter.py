@@ -1,20 +1,27 @@
-# discord_messages.py - Fixed with missing function
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+# rba_formatter.py
+from typing import List
+from models import Observation
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from geo_utils import haversine, normalize_species_name
-import discord
-from moderation_utils import ClusterModerationView, make_cluster_id
+from math import radians, sin, cos, sqrt, atan2
 
-MAX_DISCORD_MSG_LEN = 2000
-RECENT_HOURS = 24
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+def normalize_species_name(name: str) -> str:
+    base = name.split("(")[0].strip()
+    return "".join(c.lower() for c in base if c.isalnum() or c.isspace())
 
 def cluster_observations(observations, threshold_km=2):
     clusters = {}  # key -> list[obs]
 
     for obs in observations:
-        norm_name = normalize_species_name(obs.species)
-        lat, lon = obs.lat, obs.lon
+        norm_name = normalize_species_name(obs['comName'])
+        lat, lon = obs['lat'], obs['lng']
 
         match_key = None
         for (sp, clat, clon, loc) in clusters.keys():
@@ -27,83 +34,13 @@ def cluster_observations(observations, threshold_km=2):
         if match_key:
             clusters[match_key].append(obs)
         else:
-            key = (obs.species, lat, lon, obs.location or "Unknown")
+            key = (obs['comName'], lat, lon, obs.get('locName', 'Unknown'))
             clusters[key] = [obs]
 
     return clusters
 
-def build_cluster_moderation_message(cluster_observations):
-    """
-    Build a moderation message for a cluster of observations.
-    Returns an embed and Discord view with buttons.
-    """
-    if not cluster_observations:
-        return None, None
-    
-    # Get first observation for basic info
-    first_obs = cluster_observations[0]
-    species_name = first_obs.get('comName', 'Unknown Species')
-    location = first_obs.get('locName', 'Unknown Location')
-    
-    # Sort by most recent first
-    obs_sorted = sorted(cluster_observations, key=lambda o: o.get('obsDt', ''), reverse=True)
-    most_recent = obs_sorted[0]
-    
-    # Create embed
-    embed = discord.Embed(
-        title=f"🔍 Moderation Required: {species_name}",
-        color=0xffaa00,
-        timestamp=datetime.now(timezone.utc)
-    )
-    
-    embed.add_field(name="Location", value=location, inline=True)
-    embed.add_field(name="Most Recent Observer", value=most_recent.get('userDisplayName', 'Unknown'), inline=True)
-    embed.add_field(name="Total Reports", value=len(cluster_observations), inline=True)
-    
-    lat, lon = first_obs.get('lat'), first_obs.get('lng')
-    if lat and lon:
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-        embed.add_field(name="📍 Map", value=f"[View Location]({maps_url})", inline=False)
-    
-    # Add all observers (up to 5)
-    observers = []
-    for obs in obs_sorted:
-        observer_name = obs.get('userDisplayName', 'Unknown')
-        checklist_id = obs.get('subId', '')
-        if checklist_id:
-            checklist_url = f"https://ebird.org/checklist/{checklist_id}"
-            observer_text = f"[{observer_name}]({checklist_url})"
-        else:
-            observer_text = observer_name
-            
-        if obs.get('hasRichMedia'):
-            observer_text += " 📷"
-        observers.append(observer_text)
-    
-    if len(observers) > 5:
-        shown_observers = observers[:5]
-        embed.add_field(
-            name="🔗 Observers", 
-            value=", ".join(shown_observers) + f", and {len(observers) - 5} more",
-            inline=False
-        )
-    else:
-        embed.add_field(name="🔗 Observers", value=", ".join(observers), inline=False)
-    
-    # Create cluster ID and view
-    checklist_ids = [obs.get('subId') for obs in cluster_observations if obs.get('subId')]
-    cluster_id = make_cluster_id(checklist_ids)
-    
-    # Store cluster mapping
-    from cluster_registry import cluster_mapping
-    cluster_mapping[cluster_id] = checklist_ids
-    
-    view = ClusterModerationView(
-        cluster_id=cluster_id,
-        first_checklist_id=checklist_ids[0] if checklist_ids else None
-    )
-    
-    return embed, view
+MAX_DISCORD_MSG_LEN = 2000
+RECENT_HOURS = 24
 
 def chunked_rba_messages(observations: list) -> list[str]:
     """

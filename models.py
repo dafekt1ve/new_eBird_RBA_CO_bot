@@ -36,7 +36,7 @@ class Observation:
     lon: float | None = None
     counted: bool = False
     has_media: bool = False
-
+    
 
 @dataclass
 class ChecklistModeration:
@@ -49,7 +49,6 @@ class ChecklistModeration:
     moderated_by: str | None
     moderated_at: datetime | None = None
     merge_target_thread: str | None = None
-
 
 @dataclass
 class MissedObservation:

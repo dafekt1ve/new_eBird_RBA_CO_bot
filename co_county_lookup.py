@@ -59,6 +59,21 @@ def lookup_region_code(name: str) -> str | None:
             return code
     return None
 
+def get_county_name_from_code(code: str) -> str:
+    """
+    Given a subnational2 eBird code like 'US-CO-013', return the county name from the DB.
+    """
+    if not code:
+        return "Unknown"
+    
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM regions WHERE code = ?", (code,))
+    row = cur.fetchone()
+    conn.close()
+    
+    return row[0] if row else "Unknown"
+
 def get_all_county_regions() -> List[Dict[str, str]]:
     """
     Returns a list of all counties in US-CO from the regions table.
