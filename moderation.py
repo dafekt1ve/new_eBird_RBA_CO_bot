@@ -1,4 +1,4 @@
-# moderation.py - Complete moderation system for statewide RBAs
+# moderation.py - Complete moderation system with datetime fixes
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timezone, timedelta
@@ -6,22 +6,49 @@ from time import time
 import asyncio
 import logging
 from typing import List, Dict, Optional
-from dotenv import load_dotenv
-import os
 
 from db import (
     save_pending_checklist, get_pending_moderation, update_moderation_status,
     is_checklist_rejected, find_nearby_thread, save_thread, add_thread_participant,
-    get_thread_participants, mark_checklist_processed_for_moderation,
-    get_unprocessed_checklists_for_moderation, get_moderation_item_by_message_id
+    mark_checklist_processed_for_moderation,
+    get_moderation_item_by_message_id
 )
-from co_review_loader import get_species_review_status, is_species_statewide_rba
+from co_review_loader import is_species_statewide_rba, get_species_review_status
 from models import Observation, ThreadRecord
 from ebird_api import fetch_ebird_rba
 from time_utils import ebird_local_to_utc, get_timezone_name
-from geo_utils import haversine, normalize_species_name
+from geo_utils import normalize_species_name
 
 logger = logging.getLogger("Dipper_RBA_Bot")
+
+def safe_datetime_parse(dt_input):
+    """
+    Safely parse datetime input that could be a string, datetime, or dict.
+    Returns a datetime object or None if parsing fails.
+    """
+    if dt_input is None:
+        return None
+    
+    if isinstance(dt_input, datetime):
+        return dt_input
+    
+    if isinstance(dt_input, str):
+        try:
+            # Try parsing ISO format
+            return datetime.fromisoformat(dt_input.replace('Z', '+00:00'))
+        except ValueError:
+            try:
+                # Try parsing eBird format
+                return datetime.strptime(dt_input, "%Y-%m-%d %H:%M")
+            except ValueError:
+                logger.error(f"Could not parse datetime string: {dt_input}")
+                return None
+    
+    if isinstance(dt_input, dict) and 'obs_datetime' in dt_input:
+        return safe_datetime_parse(dt_input['obs_datetime'])
+    
+    logger.error(f"Unexpected datetime input type: {type(dt_input)} - {dt_input}")
+    return None
 
 class ModerationView(discord.ui.View):
     """Persistent view for moderation buttons"""
@@ -59,7 +86,7 @@ class ModerationView(discord.ui.View):
                 success = await self.handle_acceptance(mod_item, moderator, interaction)
                 if success:
                     await interaction.response.edit_message(
-                        content=f"✅ **ACCEPTED** by {moderator}\n\n" + interaction.message.content,
+                        content=f"✅ **ACCEPTED** by {moderator}\n\n" + (interaction.message.content or ""),
                         view=None  # Remove buttons
                     )
                 else:
@@ -71,7 +98,7 @@ class ModerationView(discord.ui.View):
                     'rejected', moderator
                 )
                 await interaction.response.edit_message(
-                    content=f"❌ **REJECTED** by {moderator}\n\n" + interaction.message.content,
+                    content=f"❌ **REJECTED** by {moderator}\n\n" + (interaction.message.content or ""),
                     view=None
                 )
                 logger.info(f"Rejected: {mod_item['species']} from {mod_item['checklist_id']} by {moderator}")
@@ -84,11 +111,29 @@ class ModerationView(discord.ui.View):
         """Handle acceptance logic - create or merge with thread"""
         try:
             species = mod_item['species']
-            lat, lon = mod_item['lat'], mod_item['lon']
+            lat, lon = mod_item.get('lat'), mod_item.get('lon')
             region = mod_item['region']
-            obs_datetime = datetime.fromisoformat(mod_item['obs_datetime'])
-            logger.debug(f"Obs datetime: {type(obs_datetime)}")
-
+            
+            logger.debug(f"Processing acceptance for {species}")
+            logger.debug(f"Raw obs_datetime from mod_item: {mod_item.get('obs_datetime')}")
+            logger.debug(f"Obs datetime type: {type(mod_item.get('obs_datetime'))}")
+            
+            # CRITICAL FIX: Safely parse the datetime
+            obs_datetime_raw = mod_item.get('obs_datetime')
+            obs_datetime = safe_datetime_parse(ebird_local_to_utc(obs_datetime_raw, mod_item.get('lat'), mod_item.get('lon')))
+            logger.debug(f"Parsed Obs datetime type: {type(obs_datetime)}")
+            
+            if obs_datetime is None:
+                logger.error(f"Could not parse obs_datetime: {obs_datetime_raw}")
+                obs_datetime = datetime.now(timezone.utc)  # Fallback to current time
+            
+            # Ensure datetime is timezone-aware
+            if obs_datetime.tzinfo is None:
+                obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
+                # obs_datetime = obs_datetime.replace(tzinfo=timezone.utc)
+            
+            logger.debug(f"Parsed obs_datetime: {obs_datetime}")
+            
             # Check for nearby existing thread
             existing_thread_key = None
             if lat is not None and lon is not None:
@@ -100,43 +145,45 @@ class ModerationView(discord.ui.View):
                 logger.info(f"Merging {species} with existing thread {thread_tracker_key}")
             else:
                 # Create new thread
-                thread_tracker_key = f"{species}, {region}, {obs_datetime.strftime('%b %Y')}"
+                thread_tracker_key = f"{species}|{region}|{int(time())}"
                 
                 # Create thread in statewide forum
-                forum_channel = interaction.guild.get_channel(STATEWIDE_FORUM_CHANNEL_ID)
-                if forum_channel and isinstance(forum_channel, discord.ForumChannel):
-                    # Create thread in forum
-                    location_str = mod_item.get('location', 'Unknown Location')
-                    thread_name = f"{species} - {location_str}"
-                    
-                    # Create initial embed for the thread
-                    embed = await create_thread_embed(mod_item)
-                    
-                    thread = await forum_channel.create_thread(
-                        name=thread_name,
-                        content=f"**{species}** sighting accepted for statewide tracking",
-                        embed=embed
-                    )
-                    
-                    # Save thread to database
-                    thread_record = ThreadRecord(
-                        tracker_key=thread_tracker_key,
-                        thread_id=thread.thread.id,
-                        type="bot",
-                        last_seen_at=obs_datetime.strftime("%Y-%m-%d %H:%M"),
-                        status_bucket="<24h"
-                    )
-                    thread_record.discord_channel_id = thread.thread.id
-                    save_thread(thread_record)
-                    
-                    logger.info(f"Created new thread {thread_tracker_key} in forum")
+                statewide_forum_channel_id = getattr(interaction.client, 'statewide_forum_channel_id', None)
+                if statewide_forum_channel_id:
+                    forum_channel = interaction.guild.get_channel(statewide_forum_channel_id)
+                    if forum_channel and isinstance(forum_channel, discord.ForumChannel):
+                        # Create thread in forum
+                        location_str = mod_item.get('location', 'Unknown Location')
+                        thread_name = f"{species} - {location_str}"
+                        
+                        # Create initial embed for the thread
+                        embed = await create_thread_embed(mod_item)
+                        
+                        thread = await forum_channel.create_thread(
+                            name=thread_name,
+                            content=f"**{species}** sighting accepted for statewide tracking",
+                            embed=embed
+                        )
+                        
+                        # Save thread to database
+                        thread_record = ThreadRecord(
+                            tracker_key=thread_tracker_key,
+                            thread_id=thread.thread.id,
+                            type="bot",
+                            last_seen_at=obs_datetime,
+                            status_bucket="<24h"
+                        )
+                        thread_record.discord_channel_id = thread.thread.id
+                        save_thread(thread_record)
+                        
+                        logger.info(f"Created new thread {thread_tracker_key} in forum")
             
             # Add participant to thread
             add_thread_participant(
                 thread_tracker_key, 
-                mod_item['observer'], 
+                mod_item.get('observer', 'Unknown'), 
                 mod_item['checklist_id'], 
-                obs_datetime.strftime("%Y-%m-%d %H:%M")
+                obs_datetime
             )
             
             # Update moderation status
@@ -150,26 +197,25 @@ class ModerationView(discord.ui.View):
             
         except Exception as e:
             logger.error(f"Error in acceptance handling: {e}")
+            logger.error(f"mod_item: {mod_item}")
             return False
 
 async def create_thread_embed(mod_item: dict) -> discord.Embed:
     """Create embed for thread post"""
+    # Safely parse datetime for embed
+    obs_datetime = safe_datetime_parse(ebird_local_to_utc(mod_item.get('obs_datetime'), mod_item.get('lat'), mod_item.get('lon')))
+    if obs_datetime is None:
+        obs_datetime = datetime.now(timezone.utc)
+    
     embed = discord.Embed(
-        title=f"🦅 {mod_item['species']}",
-        color=0x00ff00,
-        timestamp=mod_item['obs_datetime'].strftime("%Y-%m-%d %H:%M")
+        title=f"{mod_item['species']}, {mod_item['region']}, {obs_datetime.strftime('%b %Y')}",
+        color=0xffaa00,
+        timestamp=obs_datetime
     )
     
-    embed.add_field(name="Location", value=mod_item.get('location', 'Unknown'), inline=True)
-    embed.add_field(name="Observer", value=mod_item.get('observer', 'Unknown'), inline=True)
-    embed.add_field(name="Region", value=mod_item.get('region', 'Unknown'), inline=True)
-    
-    if mod_item.get('lat') and mod_item.get('lon'):
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']}"
-        embed.add_field(name="📍 Map", value=f"[View Location]({maps_url})", inline=False)
-    
-    checklist_url = f"https://ebird.org/checklist/{mod_item['checklist_id']}"
-    embed.add_field(name="🔗 eBird", value=f"[View Checklist]({checklist_url})", inline=False)
+    embed.add_field(name="Observer", value=f"[{mod_item.get('observer', 'Unknown')}](https://ebird.org/checklist/{mod_item['checklist_id']})", inline=True)
+    embed.add_field(name="Location", value=f"[{mod_item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']})", inline=True)
+    embed.add_field(name="County", value=mod_item.get('region', 'Unknown'), inline=True)
     
     return embed
 
@@ -180,6 +226,10 @@ class ModerationSystem:
         self.bot = bot
         self.moderation_channel_id = moderation_channel_id
         self.statewide_forum_channel_id = statewide_forum_channel_id
+        
+        # Store channel IDs on bot for access in views
+        self.bot.moderation_channel_id = moderation_channel_id
+        self.bot.statewide_forum_channel_id = statewide_forum_channel_id
         
         # Start background tasks
         self.process_statewide_rba.start()
@@ -269,11 +319,9 @@ class ModerationSystem:
             if is_checklist_rejected(obs.checklist_id, obs.species):
                 return
             
-            # Check if it's a statewide RBA species
-            species = normalize_species_name(obs.species)
-            # print(f"Processing {obs.species}")
-            # print(f"Normalized species: {species}")
-            if not species or not is_species_statewide_rba(species):
+            # Check if it's a statewide RBA species using CO Review List
+            # Use common name (obs.species) instead of species code
+            if not is_species_statewide_rba(normalize_species_name(obs.species)):
                 mark_checklist_processed_for_moderation(obs.checklist_id)
                 return
             
@@ -304,8 +352,6 @@ class ModerationSystem:
         """Send pending moderation items to Discord"""
         try:
             pending_items = get_pending_moderation()
-            print(f"Pending moderation items: {len(pending_items)}")
-            print(f"Moderation channel ID: {self.moderation_channel_id}")
             moderation_channel = self.bot.get_channel(int(self.moderation_channel_id))
             
             if not moderation_channel:
@@ -325,24 +371,24 @@ class ModerationSystem:
     async def send_moderation_message(self, channel: discord.TextChannel, item: dict):
         """Send a moderation message to Discord"""
         try:
-            # Check why it needs moderation
-            review_status = get_species_review_status(normalize_species_name(item['species']))
-            # print(f"\n\n{item['species']} is a {item['is_review_species']} review species")
-            print(f"review_status: {review_status}")
-            if review_status == 'in_review_list':
-                return
-        
-            print(item)
-            obs_datetime = datetime.fromisoformat(item['obs_datetime'])
+            review_status = get_species_review_status(item['species'])
+            if review_status['is_review_species'] is False and review_status['in_review_list']:
+                return  # No moderation needed
+            
+            # Safely parse datetime for embed
+            obs_datetime = safe_datetime_parse(item.get('obs_datetime'))
+            if obs_datetime is None:
+                obs_datetime = datetime.now(timezone.utc)
+            
             embed = discord.Embed(
                 title=f"{item['species']}, {item['region']}, {obs_datetime.strftime('%b %Y')}",
                 color=0xffaa00,
-                timestamp=datetime.fromisoformat(item['obs_datetime'])
+                timestamp=obs_datetime
             )
-
+            
             embed.add_field(name="Observer", value=f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})", inline=True)
             embed.add_field(name="Location", value=f"[{item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']})", inline=True)
-            embed.add_field(name="Region", value=item.get('region', 'Unknown'), inline=True)
+            embed.add_field(name="County", value=item.get('region', 'Unknown'), inline=True)
             
             view = ModerationView()
             message = await channel.send(embed=embed, view=view)
@@ -438,10 +484,6 @@ class ModerationSystem:
                 
         except Exception as e:
             logger.error(f"Error updating Discord thread title: {e}")
-
-# # Global constants - set these in your bot_main.py
-MODERATION_CHANNEL_ID = os.getenv("MODERATION_CHANNEL_ID")
-STATEWIDE_FORUM_CHANNEL_ID = os.getenv("STATEWIDE_FORUM_CHANNEL_ID")
 
 async def setup_moderation_system(bot: commands.Bot, moderation_channel_id: int, statewide_forum_channel_id: int) -> ModerationSystem:
     """Setup and return moderation system"""

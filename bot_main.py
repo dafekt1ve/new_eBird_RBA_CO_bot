@@ -188,7 +188,7 @@ async def handle_rba_command(channel, region_code: str):
         obs = Observation(
             checklist_id=d.get("subId"),
             species=d.get("comName"),
-            region=region_code,
+            region=d.get("subnational2Name"),
             location=d.get("locName", "Unknown"),
             observer=d.get("userDisplayName", "Unknown"),
             obs_datetime=obs_utc,
