@@ -11,50 +11,54 @@ from db import (
     save_pending_checklist, get_pending_moderation, update_moderation_status,
     is_checklist_rejected, find_nearby_thread, save_thread, add_thread_participant,
     mark_checklist_processed_for_moderation,
-    get_moderation_item_by_message_id
+    get_moderation_item_by_message_id, get_merge_candidates
 )
 from co_review_loader import is_species_statewide_rba, get_species_review_status
 from models import Observation, ThreadRecord
 from ebird_api import fetch_ebird_rba
 from time_utils import ebird_local_to_utc, get_timezone_name
-from geo_utils import normalize_species_name
+from geo_utils import normalize_species_name, haversine
 
 logger = logging.getLogger("Dipper_RBA_Bot")
 
 def safe_datetime_parse(dt_input):
     """
     Safely parse datetime input that could be a string, datetime, or dict.
-    Returns a datetime object or None if parsing fails.
+    Returns a timezone-aware datetime object or None if parsing fails.
     """
     if dt_input is None:
         return None
     
     if isinstance(dt_input, datetime):
+        # Ensure it's timezone-aware
+        if dt_input.tzinfo is None:
+            return dt_input.replace(tzinfo=timezone.utc)
         return dt_input
     
     if isinstance(dt_input, str):
         try:
-            # Try parsing ISO format
-            return datetime.fromisoformat(dt_input.replace('Z', '+00:00'))
-        except ValueError:
-            try:
-                # Try parsing eBird format
-                return datetime.strptime(dt_input, "%Y-%m-%d %H:%M")
-            except ValueError:
-                logger.error(f"Could not parse datetime string: {dt_input}")
-                return None
-    
-    if isinstance(dt_input, dict) and 'obs_datetime' in dt_input:
-        return safe_datetime_parse(dt_input['obs_datetime'])
+            # Try parsing ISO format first (handles timezone info)
+            if 'T' in dt_input or '+' in dt_input or dt_input.endswith('Z'):
+                return datetime.fromisoformat(dt_input.replace('Z', '+00:00'))
+            # Try eBird format (naive datetime)
+            naive_dt = datetime.strptime(dt_input, "%Y-%m-%d %H:%M")
+            return naive_dt.replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            logger.error(f"Could not parse datetime string '{dt_input}': {e}")
+            return None
     
     logger.error(f"Unexpected datetime input type: {type(dt_input)} - {dt_input}")
     return None
 
 class ModerationView(discord.ui.View):
-    """Persistent view for moderation buttons"""
+    """Persistent view for moderation buttons with merge dropdown"""
     
-    def __init__(self):
-        super().__init__(timeout=None)  # No timeout for persistent views
+    def __init__(self, merge_candidates: List[Dict] = None):
+        super().__init__(timeout=None)
+        
+        # Add merge dropdown if there are candidates
+        if merge_candidates:
+            self.add_item(MergeDropdown(merge_candidates))
     
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="mod_accept", emoji="✅")
     async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -67,7 +71,6 @@ class ModerationView(discord.ui.View):
     async def handle_moderation(self, interaction: discord.Interaction, action: str):
         """Handle accept/reject button clicks"""
         try:
-            # Get moderation item from database
             mod_item = get_moderation_item_by_message_id(interaction.message.id)
             if not mod_item:
                 await interaction.response.send_message("⚠️ Could not find moderation item.", ephemeral=True)
@@ -75,7 +78,7 @@ class ModerationView(discord.ui.View):
             
             if mod_item['status'] != 'pending':
                 await interaction.response.send_message(
-                    f"⚠️ This item has already been {mod_item['status']} by {mod_item['moderated_by']}", 
+                    f"⚠️ This item has already been {mod_item['status']} by {mod_item.get('moderated_by', 'someone')}", 
                     ephemeral=True
                 )
                 return
@@ -86,26 +89,30 @@ class ModerationView(discord.ui.View):
                 success = await self.handle_acceptance(mod_item, moderator, interaction)
                 if success:
                     await interaction.response.edit_message(
-                        content=f"✅ **ACCEPTED** by {moderator}\n\n" + (interaction.message.content or ""),
-                        view=None  # Remove buttons
+                        content=f"✅ **ACCEPTED** by {moderator}\n\n",
+                        embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+                        view=None
                     )
                 else:
                     await interaction.response.send_message("❌ Error processing acceptance.", ephemeral=True)
             
             elif action == "rejected":
                 update_moderation_status(
-                    mod_item['checklist_id'], mod_item['species'], 
-                    'rejected', moderator
+                    mod_item['checklist_id'], 'rejected', moderator, species=mod_item['species']
                 )
                 await interaction.response.edit_message(
-                    content=f"❌ **REJECTED** by {moderator}\n\n" + (interaction.message.content or ""),
+                    content=f"❌ **REJECTED** by {moderator}\n\n",
+                    embed=interaction.message.embeds[0] if interaction.message.embeds else None,
                     view=None
                 )
                 logger.info(f"Rejected: {mod_item['species']} from {mod_item['checklist_id']} by {moderator}")
         
         except Exception as e:
             logger.error(f"Error in moderation handling: {e}")
-            await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ An error occurred.", ephemeral=True)
     
     async def handle_acceptance(self, mod_item: dict, moderator: str, interaction: discord.Interaction) -> bool:
         """Handle acceptance logic - create or merge with thread"""
@@ -114,25 +121,16 @@ class ModerationView(discord.ui.View):
             lat, lon = mod_item.get('lat'), mod_item.get('lon')
             region = mod_item['region']
             
-            logger.debug(f"Processing acceptance for {species}")
-            logger.debug(f"Raw obs_datetime from mod_item: {mod_item.get('obs_datetime')}")
-            logger.debug(f"Obs datetime type: {type(mod_item.get('obs_datetime'))}")
-            
-            # CRITICAL FIX: Safely parse the datetime
+            # Fix datetime parsing
             obs_datetime_raw = mod_item.get('obs_datetime')
-            obs_datetime = safe_datetime_parse(ebird_local_to_utc(obs_datetime_raw, mod_item.get('lat'), mod_item.get('lon')))
-            logger.debug(f"Parsed Obs datetime type: {type(obs_datetime)}")
+            if isinstance(obs_datetime_raw, str) and lat and lon:
+                obs_datetime = ebird_local_to_utc(obs_datetime_raw, lat, lon)
+            else:
+                obs_datetime = safe_datetime_parse(obs_datetime_raw)
             
             if obs_datetime is None:
                 logger.error(f"Could not parse obs_datetime: {obs_datetime_raw}")
-                obs_datetime = datetime.now(timezone.utc)  # Fallback to current time
-            
-            # Ensure datetime is timezone-aware
-            if obs_datetime.tzinfo is None:
-                obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
-                # obs_datetime = obs_datetime.replace(tzinfo=timezone.utc)
-            
-            logger.debug(f"Parsed obs_datetime: {obs_datetime}")
+                obs_datetime = datetime.now(timezone.utc)
             
             # Check for nearby existing thread
             existing_thread_key = None
@@ -140,43 +138,15 @@ class ModerationView(discord.ui.View):
                 existing_thread_key = find_nearby_thread(species, lat, lon, distance_km=4.0)
             
             if existing_thread_key:
-                # Merge with existing thread
                 thread_tracker_key = existing_thread_key
                 logger.info(f"Merging {species} with existing thread {thread_tracker_key}")
             else:
-                # Create new thread
                 thread_tracker_key = f"{species}|{region}|{int(time())}"
                 
                 # Create thread in statewide forum
-                statewide_forum_channel_id = getattr(interaction.client, 'statewide_forum_channel_id', None)
-                if statewide_forum_channel_id:
-                    forum_channel = interaction.guild.get_channel(statewide_forum_channel_id)
-                    if forum_channel and isinstance(forum_channel, discord.ForumChannel):
-                        # Create thread in forum
-                        location_str = mod_item.get('location', 'Unknown Location')
-                        thread_name = f"{species} - {location_str}"
-                        
-                        # Create initial embed for the thread
-                        embed = await create_thread_embed(mod_item)
-                        
-                        thread = await forum_channel.create_thread(
-                            name=thread_name,
-                            content=f"**{species}** sighting accepted for statewide tracking",
-                            embed=embed
-                        )
-                        
-                        # Save thread to database
-                        thread_record = ThreadRecord(
-                            tracker_key=thread_tracker_key,
-                            thread_id=thread.thread.id,
-                            type="bot",
-                            last_seen_at=obs_datetime,
-                            status_bucket="<24h"
-                        )
-                        thread_record.discord_channel_id = thread.thread.id
-                        save_thread(thread_record)
-                        
-                        logger.info(f"Created new thread {thread_tracker_key} in forum")
+                success = await self.create_statewide_thread(mod_item, thread_tracker_key, interaction)
+                if not success:
+                    return False
             
             # Add participant to thread
             add_thread_participant(
@@ -188,8 +158,8 @@ class ModerationView(discord.ui.View):
             
             # Update moderation status
             update_moderation_status(
-                mod_item['checklist_id'], mod_item['species'],
-                'accepted', moderator, thread_tracker_key
+                mod_item['checklist_id'], 'accepted', moderator, 
+                species=mod_item['species'], merge_target_thread=thread_tracker_key
             )
             
             logger.info(f"Accepted: {species} from {mod_item['checklist_id']} by {moderator}")
@@ -197,13 +167,115 @@ class ModerationView(discord.ui.View):
             
         except Exception as e:
             logger.error(f"Error in acceptance handling: {e}")
-            logger.error(f"mod_item: {mod_item}")
             return False
+    
+    async def create_statewide_thread(self, mod_item: dict, thread_tracker_key: str, interaction: discord.Interaction) -> bool:
+        """Create new thread in statewide forum"""
+        try:
+            statewide_forum_channel_id = getattr(interaction.client, 'statewide_forum_channel_id', None)
+            if not statewide_forum_channel_id:
+                logger.error("Statewide forum channel ID not configured")
+                return False
+                
+            forum_channel = interaction.guild.get_channel(int(statewide_forum_channel_id))
+            if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+                logger.error(f"Forum channel not found or wrong type: {statewide_forum_channel_id}")
+                return False
+            
+            location_str = mod_item.get('location', 'Unknown Location')
+            thread_name = f"{mod_item['species']} - {location_str}"
+            
+            embed = await create_thread_embed(mod_item)
+            
+            thread = await forum_channel.create_thread(
+                name=thread_name,
+                content=f"**{mod_item['species']}** sighting accepted for statewide tracking",
+                embed=embed
+            )
+            
+            # Parse datetime for thread record
+            obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
+            if obs_datetime is None:
+                obs_datetime = datetime.now(timezone.utc)
+            
+            thread_record = ThreadRecord(
+                tracker_key=thread_tracker_key,
+                thread_id=thread.thread.id,
+                type="bot",
+                last_seen_at=obs_datetime,
+                status_bucket="<24h"
+            )
+            thread_record.discord_channel_id = thread.thread.id
+            save_thread(thread_record)
+            
+            logger.info(f"Created new thread {thread_tracker_key} in forum")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating statewide thread: {e}")
+            return False
+
+class MergeDropdown(discord.ui.Select):
+    """Dropdown for selecting merge target"""
+    
+    def __init__(self, merge_candidates: List[Dict]):
+        options = []
+        for candidate in merge_candidates[:25]:  # Discord limit
+            options.append(discord.SelectOption(
+                label=f"{candidate['species']} - {candidate['location'][:50]}",
+                description=f"Distance: {candidate['distance']:.1f}km",
+                value=candidate['thread_tracker_key']
+            ))
+        
+        super().__init__(
+            placeholder="Select thread to merge with...",
+            options=options,
+            custom_id="merge_select"
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        """Handle merge selection"""
+        try:
+            target_thread = self.values[0]
+            mod_item = get_moderation_item_by_message_id(interaction.message.id)
+            
+            if not mod_item:
+                await interaction.response.send_message("⚠️ Could not find moderation item.", ephemeral=True)
+                return
+            
+            moderator = str(interaction.user)
+            
+            # Add to existing thread
+            obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
+            if obs_datetime is None:
+                obs_datetime = datetime.now(timezone.utc)
+            
+            add_thread_participant(
+                target_thread,
+                mod_item.get('observer', 'Unknown'),
+                mod_item['checklist_id'],
+                obs_datetime
+            )
+            
+            # Update moderation status
+            update_moderation_status(
+                mod_item['checklist_id'], 'accepted', moderator,
+                species=mod_item['species'], merge_target_thread=target_thread
+            )
+            
+            await interaction.response.edit_message(
+                content=f"✅ **MERGED** with existing thread by {moderator}\n\n",
+                embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+                view=None
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in merge handling: {e}")
+            await interaction.response.send_message("❌ Error processing merge.", ephemeral=True)
 
 async def create_thread_embed(mod_item: dict) -> discord.Embed:
     """Create embed for thread post"""
-    # Safely parse datetime for embed
-    obs_datetime = safe_datetime_parse(ebird_local_to_utc(mod_item.get('obs_datetime'), mod_item.get('lat'), mod_item.get('lon')))
+    obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
     if obs_datetime is None:
         obs_datetime = datetime.now(timezone.utc)
     
@@ -213,8 +285,15 @@ async def create_thread_embed(mod_item: dict) -> discord.Embed:
         timestamp=obs_datetime
     )
     
-    embed.add_field(name="Observer", value=f"[{mod_item.get('observer', 'Unknown')}](https://ebird.org/checklist/{mod_item['checklist_id']})", inline=True)
-    embed.add_field(name="Location", value=f"[{mod_item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']})", inline=True)
+    observer_link = f"[{mod_item.get('observer', 'Unknown')}](https://ebird.org/checklist/{mod_item['checklist_id']})"
+    embed.add_field(name="Observer", value=observer_link, inline=True)
+    
+    if mod_item.get('lat') and mod_item.get('lon'):
+        location_link = f"[{mod_item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']})"
+        embed.add_field(name="Location", value=location_link, inline=True)
+    else:
+        embed.add_field(name="Location", value=mod_item.get('location', 'Unknown'), inline=True)
+    
     embed.add_field(name="County", value=mod_item.get('region', 'Unknown'), inline=True)
     
     return embed
@@ -249,12 +328,14 @@ class ModerationSystem:
         try:
             logger.info("Starting statewide RBA processing...")
             
-            # Fetch statewide data
             statewide_obs = await self.fetch_statewide_observations()
             
-            # Process each observation
-            for obs in statewide_obs:
-                await self.process_observation_for_moderation(obs)
+            # Group observations by species and proximity for clustering
+            clusters = self.cluster_observations(statewide_obs, radius_km=2.0)
+            
+            # Process each cluster
+            for cluster in clusters:
+                await self.process_cluster_for_moderation(cluster)
                 
             # Process pending moderation queue
             await self.process_pending_moderation()
@@ -263,6 +344,33 @@ class ModerationSystem:
             
         except Exception as e:
             logger.error(f"Error in statewide RBA processing: {e}")
+    
+    def cluster_observations(self, observations: List[Observation], radius_km: float = 2.0) -> List[List[Observation]]:
+        """Cluster observations by species and proximity"""
+        clusters = []
+        processed = set()
+        
+        for i, obs in enumerate(observations):
+            if i in processed:
+                continue
+                
+            cluster = [obs]
+            processed.add(i)
+            
+            # Find nearby observations of same species
+            for j, other_obs in enumerate(observations[i+1:], i+1):
+                if j in processed:
+                    continue
+                    
+                if (obs.species == other_obs.species and 
+                    obs.lat and obs.lon and other_obs.lat and other_obs.lon and
+                    haversine(obs.lat, obs.lon, other_obs.lat, other_obs.lon) <= radius_km):
+                    cluster.append(other_obs)
+                    processed.add(j)
+            
+            clusters.append(cluster)
+        
+        return clusters
     
     @process_statewide_rba.before_loop
     async def before_process_statewide_rba(self):
@@ -286,7 +394,7 @@ class ModerationSystem:
                 try:
                     obs_utc = ebird_local_to_utc(d.get("obsDt"), lat, lon)
                 except Exception:
-                    continue  # Skip malformed dates
+                    continue
 
                 obs = Observation(
                     checklist_id=d.get("subId"),
@@ -302,7 +410,6 @@ class ModerationSystem:
                     has_media=bool(d.get("hasRichMedia", []))
                 )
                 
-                # Add species code if available
                 obs.species_code = d.get("speciesCode")
                 observations.append(obs)
             
@@ -312,41 +419,53 @@ class ModerationSystem:
             logger.error(f"Error fetching statewide observations: {e}")
             return []
     
-    async def process_observation_for_moderation(self, obs: Observation):
-        """Process a single observation to see if it needs moderation"""
+    async def process_cluster_for_moderation(self, cluster: List[Observation]):
+        """Process a cluster of observations for moderation"""
         try:
+            # Use first observation as representative
+            representative_obs = cluster[0]
+            
             # Skip if already processed
-            if is_checklist_rejected(obs.checklist_id, obs.species):
+            if is_checklist_rejected(representative_obs.checklist_id, representative_obs.species):
                 return
             
-            # Check if it's a statewide RBA species using CO Review List
-            # Use common name (obs.species) instead of species code
-            if not is_species_statewide_rba(normalize_species_name(obs.species)):
-                mark_checklist_processed_for_moderation(obs.checklist_id)
-                return
-            
-            # Check if nearby thread exists (within 4km) - if so, just add to thread
-            if obs.lat is not None and obs.lon is not None:
-                nearby_thread = find_nearby_thread(obs.species, obs.lat, obs.lon, 4.0)
-                if nearby_thread:
-                    # Add to existing thread without moderation
-                    add_thread_participant(
-                        nearby_thread, obs.observer, obs.checklist_id, obs.obs_datetime
-                    )
+            # Check if it's a statewide RBA species
+            if not is_species_statewide_rba(normalize_species_name(representative_obs.species)):
+                for obs in cluster:
                     mark_checklist_processed_for_moderation(obs.checklist_id)
+                return
+            
+            # Check if nearby thread exists
+            if representative_obs.lat and representative_obs.lon:
+                nearby_thread = find_nearby_thread(
+                    representative_obs.species, 
+                    representative_obs.lat, 
+                    representative_obs.lon, 
+                    4.0
+                )
+                if nearby_thread:
+                    # Add all observations to existing thread
+                    for obs in cluster:
+                        add_thread_participant(
+                            nearby_thread, obs.observer, obs.checklist_id, obs.obs_datetime
+                        )
+                        mark_checklist_processed_for_moderation(obs.checklist_id)
+                    
                     await self.update_thread_recency_for_key(nearby_thread)
-                    logger.info(f"Added {obs.species} to existing thread {nearby_thread}")
+                    logger.info(f"Added {len(cluster)} observations to existing thread {nearby_thread}")
                     return
             
-            # Needs moderation - add to queue
-            success = save_pending_checklist(obs)
+            # Needs moderation - add representative to queue
+            success = save_pending_checklist(representative_obs)
             if success:
-                logger.info(f"Added {obs.species} from {obs.checklist_id} to moderation queue")
+                logger.info(f"Added cluster of {len(cluster)} {representative_obs.species} observations to moderation queue")
             
-            mark_checklist_processed_for_moderation(obs.checklist_id)
+            # Mark all as processed
+            for obs in cluster:
+                mark_checklist_processed_for_moderation(obs.checklist_id)
             
         except Exception as e:
-            logger.error(f"Error processing observation for moderation: {e}")
+            logger.error(f"Error processing cluster for moderation: {e}")
     
     async def process_pending_moderation(self):
         """Send pending moderation items to Discord"""
@@ -359,8 +478,7 @@ class ModerationSystem:
                 return
             
             for item in pending_items:
-                # Skip if already has Discord message
-                if item['discord_message_id']:
+                if item.get('discord_message_id'):
                     continue
                 
                 await self.send_moderation_message(moderation_channel, item)
@@ -369,13 +487,12 @@ class ModerationSystem:
             logger.error(f"Error processing pending moderation: {e}")
     
     async def send_moderation_message(self, channel: discord.TextChannel, item: dict):
-        """Send a moderation message to Discord"""
+        """Send a moderation message to Discord with merge candidates"""
         try:
             review_status = get_species_review_status(item['species'])
-            if review_status['is_review_species'] is False and review_status['in_review_list']:
-                return  # No moderation needed
+            if review_status and review_status['is_review_species'] is False and review_status['in_review_list']:
+                return
             
-            # Safely parse datetime for embed
             obs_datetime = safe_datetime_parse(item.get('obs_datetime'))
             if obs_datetime is None:
                 obs_datetime = datetime.now(timezone.utc)
@@ -386,11 +503,25 @@ class ModerationSystem:
                 timestamp=obs_datetime
             )
             
-            embed.add_field(name="Observer", value=f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})", inline=True)
-            embed.add_field(name="Location", value=f"[{item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']})", inline=True)
+            observer_link = f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})"
+            embed.add_field(name="Observer", value=observer_link, inline=True)
+            
+            if item.get('lat') and item.get('lon'):
+                location_link = f"[{item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']})"
+                embed.add_field(name="Location", value=location_link, inline=True)
+            else:
+                embed.add_field(name="Location", value=item.get('location', 'Unknown'), inline=True)
+            
             embed.add_field(name="County", value=item.get('region', 'Unknown'), inline=True)
             
-            view = ModerationView()
+            # Get merge candidates
+            merge_candidates = []
+            if item.get('lat') and item.get('lon'):
+                merge_candidates = get_merge_candidates(
+                    item['species'], item['lat'], item['lon'], item['region']
+                )
+            
+            view = ModerationView(merge_candidates)
             message = await channel.send(embed=embed, view=view)
             
             # Update database with message ID
@@ -426,7 +557,6 @@ class ModerationSystem:
         try:
             from db import get_checklists_for_thread, save_thread, get_thread
             
-            # Get thread and checklists
             thread = get_thread(thread_tracker_key)
             if not thread:
                 return
@@ -435,7 +565,6 @@ class ModerationSystem:
             if not checklists:
                 return
             
-            # Calculate new recency
             latest_dt = max(obs.obs_datetime for obs in checklists)
             now_utc = datetime.now(timezone.utc)
             delta = now_utc - latest_dt
@@ -451,13 +580,10 @@ class ModerationSystem:
             else:
                 new_bucket = ">10d"
             
-            # Update if changed
             if thread.status_bucket != new_bucket:
                 thread.status_bucket = new_bucket
                 thread.last_seen_at = latest_dt
                 save_thread(thread)
-                
-                # Update Discord thread title if possible
                 await self.update_discord_thread_title(thread)
                 
         except Exception as e:
@@ -473,10 +599,7 @@ class ModerationSystem:
             if not discord_thread or not isinstance(discord_thread, discord.Thread):
                 return
             
-            # Extract species name from tracker key
             species = thread.tracker_key.split('|')[0]
-            
-            # Update title with recency badge
             new_name = f"[{thread.status_bucket}] {species}"
             if discord_thread.name != new_name:
                 await discord_thread.edit(name=new_name)

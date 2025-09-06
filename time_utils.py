@@ -32,15 +32,34 @@ def ebird_local_to_utc(obs_datetime, lat: float, lon: float) -> datetime:
     Returns:
         UTC-aware datetime
     """
+    # Handle None or invalid coordinates
+    if lat is None or lon is None:
+        if isinstance(obs_datetime, str):
+            naive_local = datetime.strptime(obs_datetime, "%Y-%m-%d %H:%M")
+        elif isinstance(obs_datetime, datetime):
+            naive_local = obs_datetime
+        else:
+            raise TypeError("obs_datetime must be str or datetime")
+        return naive_local.replace(tzinfo=timezone.utc)
+    
     if isinstance(obs_datetime, str):
         naive_local = datetime.strptime(obs_datetime, "%Y-%m-%d %H:%M")
     elif isinstance(obs_datetime, datetime):
-        naive_local = obs_datetime
+        # If already timezone-aware, convert to naive local first
+        if obs_datetime.tzinfo is not None:
+            naive_local = obs_datetime.replace(tzinfo=None)
+        else:
+            naive_local = obs_datetime
     else:
         raise TypeError("obs_datetime must be str or datetime")
 
-    tz_name = get_timezone_name(lat, lon)
-    local_tz = pytz.timezone(tz_name)
-    aware_local = local_tz.localize(naive_local)
-    utc_dt = aware_local.astimezone(pytz.UTC)
-    return utc_dt
+    try:
+        tz_name = get_timezone_name(lat, lon)
+        local_tz = pytz.timezone(tz_name)
+        aware_local = local_tz.localize(naive_local)
+        utc_dt = aware_local.astimezone(pytz.UTC)
+        return utc_dt
+    except Exception as e:
+        logger.warning(f"Error converting timezone for {obs_datetime} at {lat},{lon}: {e}")
+        # Fallback to UTC
+        return naive_local.replace(tzinfo=timezone.utc)

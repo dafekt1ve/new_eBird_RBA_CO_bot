@@ -8,6 +8,7 @@ from geo_utils import haversine, normalize_species_name
 import logging
 from dotenv import load_dotenv
 import os
+from typing import List, Dict
 
 logger = logging.getLogger("Dipper_RBA_Bot")
 
@@ -423,3 +424,80 @@ def get_all_county_regions():
     """Get all county regions from co_county_lookup"""
     from co_county_lookup import get_all_county_regions
     return get_all_county_regions()
+
+def get_merge_candidates(species: str, lat: float, lon: float, region: str, distance_km: float = 4.0) -> List[Dict]:
+    """Get merge candidates for a species within distance and same county"""
+    conn = get_connection()
+    
+    # Get existing threads for this species in the same region
+    rows = conn.execute("""
+        SELECT DISTINCT t.tracker_key, c.lat, c.lon, c.location, c.obs_datetime
+        FROM threads t
+        JOIN checklists c ON t.tracker_key = c.thread_tracker_key
+        WHERE c.species = ? AND c.region = ? AND c.lat IS NOT NULL AND c.lon IS NOT NULL
+    """, (species, region)).fetchall()
+    
+    candidates = []
+    for row in rows:
+        distance = haversine(lat, lon, row['lat'], row['lon'])
+        if distance <= distance_km:
+            candidates.append({
+                'thread_tracker_key': row['tracker_key'],
+                'species': species,
+                'location': row['location'],
+                'distance': distance,
+                'obs_datetime': row['obs_datetime']
+            })
+    
+    # Sort by distance
+    candidates.sort(key=lambda x: x['distance'])
+    return candidates
+
+def update_moderation_status(checklist_id: str, status: str, moderated_by: str = None, 
+                           moderated_at: datetime = None, species: str = None,
+                           merge_target_thread: str = None, rejection_reason: str = None):
+    """Update moderation status - fixed parameter order to match usage"""
+    conn = get_connection()
+    
+    if moderated_at is None:
+        moderated_at = datetime.now(timezone.utc)
+    
+    with conn:
+        if species:
+            # Update specific species for checklist
+            conn.execute("""
+                UPDATE moderation_queue
+                SET status=?, moderated_by=?, moderated_at=?, merge_target_thread=?, rejection_reason=?
+                WHERE checklist_id=? AND species=?
+            """, (status, moderated_by, moderated_at.isoformat(), 
+                  merge_target_thread, rejection_reason, checklist_id, species))
+        else:
+            # Update all entries for checklist
+            conn.execute("""
+                UPDATE moderation_queue
+                SET status=?, moderated_by=?, moderated_at=?, merge_target_thread=?, rejection_reason=?
+                WHERE checklist_id=?
+            """, (status, moderated_by, moderated_at.isoformat(), 
+                  merge_target_thread, rejection_reason, checklist_id))
+        
+        # If rejected, add to rejected_checklists table
+        if status == 'rejected':
+            try:
+                if species:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO rejected_checklists (checklist_id, species, rejected_by)
+                        VALUES (?, ?, ?)
+                    """, (checklist_id, species, moderated_by))
+                else:
+                    # Get all species for this checklist and reject them
+                    species_rows = conn.execute("""
+                        SELECT DISTINCT species FROM moderation_queue WHERE checklist_id = ?
+                    """, (checklist_id,)).fetchall()
+                    
+                    for species_row in species_rows:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO rejected_checklists (checklist_id, species, rejected_by)
+                            VALUES (?, ?, ?)
+                        """, (checklist_id, species_row['species'], moderated_by))
+            except sqlite3.IntegrityError:
+                pass  # Already exists
