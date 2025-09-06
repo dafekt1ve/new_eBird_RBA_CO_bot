@@ -121,16 +121,21 @@ class ModerationView(discord.ui.View):
             lat, lon = mod_item.get('lat'), mod_item.get('lon')
             region = mod_item['region']
             
-            # Fix datetime parsing
+            # CRITICAL FIX: Parse datetime first, then convert to UTC if needed
             obs_datetime_raw = mod_item.get('obs_datetime')
-            if isinstance(obs_datetime_raw, str) and lat and lon:
-                obs_datetime = ebird_local_to_utc(obs_datetime_raw, lat, lon)
-            else:
-                obs_datetime = safe_datetime_parse(obs_datetime_raw)
-            
+            obs_datetime = safe_datetime_parse(obs_datetime_raw)
+
             if obs_datetime is None:
                 logger.error(f"Could not parse obs_datetime: {obs_datetime_raw}")
-                obs_datetime = datetime.now(timezone.utc)
+                obs_datetime = datetime.now(timezone.utc)  # Fallback to current time
+            else:
+                # If we successfully parsed it, ensure it's in UTC
+                if obs_datetime.tzinfo is None:
+                    # No timezone info, need to convert from local to UTC
+                    obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
+                elif obs_datetime.tzinfo != timezone.utc:
+                    # Has timezone but not UTC, convert to UTC
+                    obs_datetime = obs_datetime.astimezone(timezone.utc)
             
             # Check for nearby existing thread
             existing_thread_key = None
@@ -182,22 +187,22 @@ class ModerationView(discord.ui.View):
                 logger.error(f"Forum channel not found or wrong type: {statewide_forum_channel_id}")
                 return False
             
-            location_str = mod_item.get('location', 'Unknown Location')
-            thread_name = f"{mod_item['species']} - {location_str}"
-            
-            embed = await create_thread_embed(mod_item)
-            
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=f"**{mod_item['species']}** sighting accepted for statewide tracking",
-                embed=embed
-            )
-            
             # Parse datetime for thread record
             obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
             if obs_datetime is None:
                 obs_datetime = datetime.now(timezone.utc)
+
+            region_str = mod_item.get('region', 'Unknown Region')
+            thread_name = f"{mod_item['species']}, {region_str}, {obs_datetime.strftime('%b %Y')}"
+
+            embed = await create_thread_embed(mod_item)
             
+            thread = await forum_channel.create_thread(
+                name=thread_name,
+                content=f"If you'd like notifications for this report, click the 🔔 Follow button below.",
+                embed=embed
+            )
+                        
             thread_record = ThreadRecord(
                 tracker_key=thread_tracker_key,
                 thread_id=thread.thread.id,
@@ -275,9 +280,21 @@ class MergeDropdown(discord.ui.Select):
 
 async def create_thread_embed(mod_item: dict) -> discord.Embed:
     """Create embed for thread post"""
-    obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
+    # CRITICAL FIX: Parse datetime first, then convert to UTC if needed
+    obs_datetime_raw = mod_item.get('obs_datetime')
+    obs_datetime = safe_datetime_parse(obs_datetime_raw)
+
     if obs_datetime is None:
-        obs_datetime = datetime.now(timezone.utc)
+        logger.error(f"Could not parse obs_datetime: {obs_datetime_raw}")
+        obs_datetime = datetime.now(timezone.utc)  # Fallback to current time
+    else:
+        # If we successfully parsed it, ensure it's in UTC
+        if obs_datetime.tzinfo is None:
+            # No timezone info, need to convert from local to UTC
+            obs_datetime = ebird_local_to_utc(obs_datetime, mod_item['lat'], mod_item['lon'])
+        elif obs_datetime.tzinfo != timezone.utc:
+            # Has timezone but not UTC, convert to UTC
+            obs_datetime = obs_datetime.astimezone(timezone.utc)
     
     embed = discord.Embed(
         title=f"{mod_item['species']}, {mod_item['region']}, {obs_datetime.strftime('%b %Y')}",
