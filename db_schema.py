@@ -76,12 +76,8 @@ CREATE TABLE IF NOT EXISTS rejected_checklists (
 # Statewide RBA thresholds table
 STATEWIDE_THRESHOLDS_TABLE = """
 CREATE TABLE IF NOT EXISTS statewide_thresholds (
-    species_code TEXT PRIMARY KEY,
-    common_name TEXT NOT NULL,
-    threshold_count INTEGER,
-    is_review_species BOOLEAN DEFAULT 0,
-    notes TEXT,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    common_name TEXT PRIMARY KEY,
+    is_review_species BOOLEAN DEFAULT 0
 );
 """
 

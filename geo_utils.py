@@ -23,4 +23,5 @@ def normalize_species_name(name: str) -> str:
     and converting to lowercase alphanumeric.
     """
     base = name.split("(")[0].strip()
-    return "".join(c.lower() for c in base if c.isalnum() or c.isspace())
+    # return "".join(c.lower() for c in base if c.isalnum() or c.isspace())
+    return base

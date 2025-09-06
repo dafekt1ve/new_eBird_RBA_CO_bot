@@ -19,7 +19,7 @@ from co_review_loader import get_species_review_status, is_species_statewide_rba
 from models import Observation, ThreadRecord
 from ebird_api import fetch_ebird_rba
 from time_utils import ebird_local_to_utc, get_timezone_name
-from geo_utils import haversine
+from geo_utils import haversine, normalize_species_name
 
 logger = logging.getLogger("Dipper_RBA_Bot")
 
@@ -86,7 +86,9 @@ class ModerationView(discord.ui.View):
             species = mod_item['species']
             lat, lon = mod_item['lat'], mod_item['lon']
             region = mod_item['region']
-            
+            obs_datetime = datetime.fromisoformat(mod_item['obs_datetime'])
+            logger.debug(f"Obs datetime: {type(obs_datetime)}")
+
             # Check for nearby existing thread
             existing_thread_key = None
             if lat is not None and lon is not None:
@@ -98,10 +100,10 @@ class ModerationView(discord.ui.View):
                 logger.info(f"Merging {species} with existing thread {thread_tracker_key}")
             else:
                 # Create new thread
-                thread_tracker_key = f"{species}|{region}|{int(time())}"
+                thread_tracker_key = f"{species}, {region}, {obs_datetime.strftime('%b %Y')}"
                 
                 # Create thread in statewide forum
-                forum_channel = interaction.guild.get_channel(int(STATEWIDE_FORUM_CHANNEL_ID))
+                forum_channel = interaction.guild.get_channel(STATEWIDE_FORUM_CHANNEL_ID)
                 if forum_channel and isinstance(forum_channel, discord.ForumChannel):
                     # Create thread in forum
                     location_str = mod_item.get('location', 'Unknown Location')
@@ -121,7 +123,7 @@ class ModerationView(discord.ui.View):
                         tracker_key=thread_tracker_key,
                         thread_id=thread.thread.id,
                         type="bot",
-                        last_seen_at=datetime.fromisoformat(mod_item['obs_datetime']),
+                        last_seen_at=obs_datetime.strftime("%Y-%m-%d %H:%M"),
                         status_bucket="<24h"
                     )
                     thread_record.discord_channel_id = thread.thread.id
@@ -130,12 +132,11 @@ class ModerationView(discord.ui.View):
                     logger.info(f"Created new thread {thread_tracker_key} in forum")
             
             # Add participant to thread
-            obs_datetime = datetime.fromisoformat(mod_item['obs_datetime'])
             add_thread_participant(
                 thread_tracker_key, 
                 mod_item['observer'], 
                 mod_item['checklist_id'], 
-                obs_datetime
+                obs_datetime.strftime("%Y-%m-%d %H:%M")
             )
             
             # Update moderation status
@@ -156,7 +157,7 @@ async def create_thread_embed(mod_item: dict) -> discord.Embed:
     embed = discord.Embed(
         title=f"🦅 {mod_item['species']}",
         color=0x00ff00,
-        timestamp=datetime.fromisoformat(mod_item['obs_datetime'])
+        timestamp=mod_item['obs_datetime'].strftime("%Y-%m-%d %H:%M")
     )
     
     embed.add_field(name="Location", value=mod_item.get('location', 'Unknown'), inline=True)
@@ -179,7 +180,6 @@ class ModerationSystem:
         self.bot = bot
         self.moderation_channel_id = moderation_channel_id
         self.statewide_forum_channel_id = statewide_forum_channel_id
-        print(f"ModerationSystem initialized with moderation_channel_id={moderation_channel_id} and statewide_forum_channel_id={statewide_forum_channel_id}")
         
         # Start background tasks
         self.process_statewide_rba.start()
@@ -241,7 +241,7 @@ class ModerationSystem:
                 obs = Observation(
                     checklist_id=d.get("subId"),
                     species=d.get("comName"),
-                    region="US-CO",
+                    region=d.get("subnational2Name"),
                     location=d.get("locName", "Unknown"),
                     observer=d.get("userDisplayName", "Unknown"),
                     obs_datetime=obs_utc,
@@ -270,8 +270,10 @@ class ModerationSystem:
                 return
             
             # Check if it's a statewide RBA species
-            print(obs.species)
-            if not obs.species or not is_species_statewide_rba(obs.species):
+            species = normalize_species_name(obs.species)
+            # print(f"Processing {obs.species}")
+            # print(f"Normalized species: {species}")
+            if not species or not is_species_statewide_rba(species):
                 mark_checklist_processed_for_moderation(obs.checklist_id)
                 return
             
@@ -323,32 +325,24 @@ class ModerationSystem:
     async def send_moderation_message(self, channel: discord.TextChannel, item: dict):
         """Send a moderation message to Discord"""
         try:
+            # Check why it needs moderation
+            review_status = get_species_review_status(normalize_species_name(item['species']))
+            # print(f"\n\n{item['species']} is a {item['is_review_species']} review species")
+            print(f"review_status: {review_status}")
+            if review_status == 'in_review_list':
+                return
+        
+            print(item)
+            obs_datetime = datetime.fromisoformat(item['obs_datetime'])
             embed = discord.Embed(
-                title=f"🔍 Moderation Required: {item['species']}",
+                title=f"{item['species']}, {item['region']}, {obs_datetime.strftime('%b %Y')}",
                 color=0xffaa00,
                 timestamp=datetime.fromisoformat(item['obs_datetime'])
             )
-            
-            embed.add_field(name="Observer", value=item.get('observer', 'Unknown'), inline=True)
-            embed.add_field(name="Location", value=item.get('location', 'Unknown'), inline=True)
+
+            embed.add_field(name="Observer", value=f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})", inline=True)
+            embed.add_field(name="Location", value=f"[{item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']})", inline=True)
             embed.add_field(name="Region", value=item.get('region', 'Unknown'), inline=True)
-            
-            if item.get('lat') and item.get('lon'):
-                maps_url = f"https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']}"
-                embed.add_field(name="📍 Map", value=f"[View Location]({maps_url})", inline=False)
-            
-            checklist_url = f"https://ebird.org/checklist/{item['checklist_id']}"
-            embed.add_field(name="🔗 eBird", value=f"[View Checklist]({checklist_url})", inline=False)
-            
-            # Check why it needs moderation
-            review_status = get_species_review_status(item['species'])
-            if review_status:
-                if not review_status['in_review_list']:
-                    embed.add_field(name="⚠️ Reason", value="Not in CO Review List", inline=False)
-                elif review_status['is_review_species']:
-                    embed.add_field(name="⚠️ Reason", value="CO Review Species", inline=False)
-                else:
-                    embed.add_field(name="⚠️ Reason", value="Below threshold", inline=False)
             
             view = ModerationView()
             message = await channel.send(embed=embed, view=view)

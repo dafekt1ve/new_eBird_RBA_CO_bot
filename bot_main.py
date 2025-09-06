@@ -122,9 +122,7 @@ async def on_ready():
     if loaded_count > 0:
         summary = get_review_list_summary()
         logger.info(f"CO Review List loaded successfully:")
-        logger.info(f"  - Total species: {summary['total_species']}")
         logger.info(f"  - Review species: {summary['review_species']}")  
-        logger.info(f"  - Threshold species: {summary['threshold_species']}")
     else:
         logger.warning("Failed to load CO Review List - moderation system may not work correctly")
 
@@ -369,9 +367,7 @@ async def reload_review_list(ctx, filepath: str = "CO_Review_List.txt"):
         if loaded_count > 0:
             summary = get_review_list_summary()
             embed = discord.Embed(title="✅ CO Review List Reloaded", color=0x00ff00)
-            embed.add_field(name="Total Species", value=summary['total_species'], inline=True)
             embed.add_field(name="Review Species", value=summary['review_species'], inline=True)
-            embed.add_field(name="Threshold Species", value=summary['threshold_species'], inline=True)
             await ctx.send(embed=embed)
             logger.info(f"Reloaded CO Review List: {loaded_count} species")
         else:
@@ -419,9 +415,7 @@ async def review_summary(ctx):
         summary = get_review_list_summary()
         
         embed = discord.Embed(title="📊 CO Review List Summary", color=0x0099ff)
-        embed.add_field(name="📋 Total Species", value=summary['total_species'], inline=True)
         embed.add_field(name="🔍 Review Species", value=summary['review_species'], inline=True) 
-        embed.add_field(name="📈 Threshold Species", value=summary['threshold_species'], inline=True)
         embed.add_field(name="📁 Source File", value=summary.get('loaded_from', 'CO_Review_List.txt'), inline=False)
         
         await ctx.send(embed=embed)

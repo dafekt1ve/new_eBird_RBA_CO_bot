@@ -12,7 +12,7 @@ if not EBIRD_TOKEN:
     raise RuntimeError("EBIRD_TOKEN not set in .env")
 
 def fetch_ebird_rba(region_code, retries=3, delay=5):
-    url = f"https://api.ebird.org/v2/data/obs/{region_code}/recent/notable?detail=full&back=2&maxResults=200"
+    url = f"https://api.ebird.org/v2/data/obs/{region_code}/recent/notable?detail=full&back=2&maxResults=2000"
     headers = {"X-eBirdApiToken": EBIRD_TOKEN}
     
     for attempt in range(retries):

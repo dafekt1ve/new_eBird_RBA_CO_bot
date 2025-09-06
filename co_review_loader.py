@@ -22,36 +22,31 @@ def load_co_review_list(filepath: str = "CO_Review_List.txt"):
             conn.execute("DELETE FROM statewide_thresholds")
         
         count = 0
+        review_count = 0
         for species_name, is_review in review_data.items():
+            logger.info(f"Loading species: {species_name} - Review: {is_review}")
             species_name = species_name.strip()
             is_review_bool = str(is_review).lower() == 'true'
-            
             if not species_name:
                 continue
             
-            # For review species (True), we don't need a threshold count
-            # For non-review species (False), we'll set a default threshold or leave null
-            threshold_count = None if is_review_bool else None
-            
+            count += 1
+
             with conn:
                 conn.execute("""
                     INSERT INTO statewide_thresholds 
-                    (species_code, common_name, threshold_count, is_review_species, notes, updated_at)
-                    VALUES (?, ?, ?, ?, ?, datetime('now'))
-                """, (None, species_name, threshold_count, is_review_bool, 
-                      "Loaded from CO_Review_List.txt"))
+                    (common_name, is_review_species)
+                    VALUES (?, ?)
+                """, (species_name, is_review_bool))
             
-            count += 1
-            status = "REVIEW" if is_review_bool else "THRESHOLD"
-            logger.debug(f"Loaded: {species_name} ({status})")
+            if is_review_bool:
+                logger.info(f"Loaded from CO_Review_List.txt: {species_name} (REVIEW)")
+                review_count += 1
         
         logger.info(f"Successfully loaded {count} species from CO Review List")
         
         # Log summary
-        review_count = sum(1 for is_review in review_data.values() if str(is_review).lower() == 'true')
-        threshold_count = count - review_count
         logger.info(f"  - Review species: {review_count}")
-        logger.info(f"  - Threshold species: {threshold_count}")
         
         return count
         
@@ -71,26 +66,27 @@ def get_species_review_status(species_name: str) -> dict | None:
     Get review status for a species by common name.
     Returns dict with review info or None if not found.
     """
+    logger.info(f"\n\nChecking review status for species: {species_name}")
     try:
         conn = get_connection()
         row = conn.execute("""
-            SELECT * FROM statewide_thresholds 
+            SELECT * FROM statewide_thresholds
             WHERE common_name = ? COLLATE NOCASE
         """, (species_name,)).fetchone()
-        
+
         if row:
+            logger.info(f"Found review status for {species_name}: {row['is_review_species']}")
             return {
                 'common_name': row['common_name'],
-                'is_review_species': bool(row['is_review_species']),
-                'threshold_count': row['threshold_count'],
+                'is_review_species': row['is_review_species'],
                 'in_review_list': True
             }
         
         # Not in review list - this means it needs moderation
+        logger.info(f"DID NOT find review status for {species_name}")
         return {
             'common_name': species_name,
             'is_review_species': True,  # Default to requiring review if not in list
-            'threshold_count': None,
             'in_review_list': False
         }
         
@@ -107,7 +103,11 @@ def is_species_statewide_rba(species_name: str) -> bool:
     - If in list with "True": Always requires moderation (True)  
     - If in list with "False": Use threshold logic or don't require moderation (False)
     """
+    if " x " in species_name:
+        return False  # Hybrids don't need moderation
+
     status = get_species_review_status(species_name)
+    logger.info(f"Species {species_name} review status: {status}")
     
     if not status:
         # Error checking - default to requiring moderation for safety
@@ -120,12 +120,12 @@ def is_species_statewide_rba(species_name: str) -> bool:
     
     if status['is_review_species']:
         # Marked as review species - requires moderation
-        logger.debug(f"{species_name} is review species - requires moderation")
+        logger.debug(f"{species_name} is a review species - requires moderation")
         return True
     
     # In list and marked as "False" - could implement threshold logic here
     # For now, we'll say these don't need moderation unless you want threshold logic
-    logger.debug(f"{species_name} is in review list as threshold species - no moderation needed")
+    # logger.debug(f"{species_name} is not a review species - no moderation needed")
     return False
 
 def get_review_list_summary() -> dict:
@@ -133,16 +133,12 @@ def get_review_list_summary() -> dict:
     try:
         conn = get_connection()
         
-        total = conn.execute("SELECT COUNT(*) FROM statewide_thresholds").fetchone()[0]
         review_species = conn.execute(
-            "SELECT COUNT(*) FROM statewide_thresholds WHERE is_review_species = 1"
+            "SELECT COUNT(*) FROM statewide_thresholds WHERE is_review_species = True"
         ).fetchone()[0]
-        threshold_species = total - review_species
         
         return {
-            'total_species': total,
             'review_species': review_species,
-            'threshold_species': threshold_species,
             'loaded_from': 'CO_Review_List.txt'
         }
         
