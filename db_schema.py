@@ -36,30 +36,6 @@ CREATE TABLE IF NOT EXISTS checklists (
 );
 """
 
-# Moderation queue table - Enhanced (without species_code column)
-MODERATION_QUEUE_TABLE = """
-CREATE TABLE IF NOT EXISTS moderation_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    checklist_id TEXT NOT NULL,
-    species TEXT NOT NULL,
-    region TEXT NOT NULL,
-    observer TEXT,
-    location TEXT,
-    lat REAL,
-    lon REAL,
-    obs_datetime TEXT NOT NULL,
-    submitted_by TEXT,
-    submitted_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    status TEXT CHECK(status IN ('pending','accepted','rejected')) DEFAULT 'pending',
-    moderated_by TEXT,
-    moderated_at TEXT,
-    discord_message_id INTEGER,
-    merge_target_thread TEXT,
-    rejection_reason TEXT,
-    UNIQUE(checklist_id, species) -- Prevent duplicate moderation for same checklist+species
-);
-"""
-
 # Rejected checklists table - Track rejected items to avoid re-moderation
 REJECTED_CHECKLISTS_TABLE = """
 CREATE TABLE IF NOT EXISTS rejected_checklists (
@@ -108,9 +84,56 @@ CREATE TABLE IF NOT EXISTS misses (
 );
 """
 
-# Helper function to initialize all tables
+MODERATION_QUEUE_TABLE = """
+CREATE TABLE IF NOT EXISTS moderation_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id TEXT NOT NULL,
+    species TEXT NOT NULL,
+    species_code TEXT,
+    region TEXT NOT NULL,
+    observer TEXT,
+    location TEXT,
+    lat REAL,
+    lon REAL,
+    obs_datetime TEXT NOT NULL,
+    has_media BOOLEAN DEFAULT 0,
+    submitted_by TEXT,
+    submitted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    status TEXT CHECK(status IN ('pending','accepted','rejected')) DEFAULT 'pending',
+    moderated_by TEXT,
+    moderated_at TEXT,
+    discord_message_id INTEGER,
+    merge_target_thread TEXT,
+    rejection_reason TEXT,
+    UNIQUE(checklist_id, species)
+);
+"""
+
+# Migration function to add new columns to existing table
+def migrate_moderation_queue(connection):
+    """Add new columns to moderation_queue if they don't exist"""
+    
+    def add_column_if_not_exists(table_name, column_name, column_definition):
+        try:
+            cursor = connection.cursor()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if column_name not in columns:
+                connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+                print(f"Added column {column_name} to {table_name}")
+        except Exception as e:
+            print(f"Error adding column {column_name} to {table_name}: {e}")
+    
+    # Add the new columns
+    add_column_if_not_exists("moderation_queue", "species_code", "TEXT")
+    add_column_if_not_exists("moderation_queue", "has_media", "BOOLEAN DEFAULT 0")
+
+# Add this to your init_db function:
 def init_db(connection):
+    """Enhanced init_db that includes migrations"""
     with connection:
+        # Create all your existing tables first
         connection.execute(THREADS_TABLE)
         connection.execute(CHECKLISTS_TABLE)
         connection.execute(MODERATION_QUEUE_TABLE)
@@ -118,6 +141,9 @@ def init_db(connection):
         connection.execute(STATEWIDE_THRESHOLDS_TABLE)
         connection.execute(THREAD_PARTICIPANTS_TABLE)
         connection.execute(MISSES_TABLE)
+        
+        # Apply migrations for existing databases
+        migrate_moderation_queue(connection)
 
 # Run when executed directly
 if __name__ == "__main__":

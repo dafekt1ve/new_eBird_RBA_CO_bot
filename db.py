@@ -206,17 +206,17 @@ def save_pending_checklist(obs_or_moderation, discord_message_id: int | None = N
         obs = obs_or_moderation
         try:
             with conn:
-                # Only insert columns that exist in the table
+                # ENHANCED: Include species_code and has_media
                 conn.execute("""
                     INSERT INTO moderation_queue (
-                        checklist_id, species, region, observer, 
-                        location, lat, lon, obs_datetime, discord_message_id
+                        checklist_id, species, species_code, region, observer, 
+                        location, lat, lon, obs_datetime, has_media, discord_message_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    obs.checklist_id, obs.species, obs.region, obs.observer, 
-                    obs.location, obs.lat, obs.lon, obs.obs_datetime.isoformat(), 
-                    discord_message_id
+                    obs.checklist_id, obs.species, getattr(obs, 'species_code', ''),
+                    obs.region, obs.observer, obs.location, obs.lat, obs.lon, 
+                    obs.obs_datetime.isoformat(), obs.has_media, discord_message_id
                 ))
             return True
         except sqlite3.IntegrityError:
