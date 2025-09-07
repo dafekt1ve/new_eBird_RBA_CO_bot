@@ -13,7 +13,7 @@ from db import (
     save_pending_checklist_with_aggregation, get_pending_moderation, update_moderation_status,
     is_checklist_rejected, find_nearby_thread, save_thread, add_thread_participant,
     mark_checklist_processed_for_moderation,
-    get_moderation_item_by_message_id, get_checklists_for_thread, get_thread_participants
+    get_moderation_item_by_message_id, get_checklists_for_thread, get_merge_candidates
 )
 from co_review_loader import is_species_statewide_rba, get_species_review_status
 from models import Observation, ThreadRecord
