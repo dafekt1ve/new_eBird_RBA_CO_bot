@@ -6,6 +6,8 @@ from time import time
 import asyncio
 import logging
 from typing import List, Dict, Optional
+from datetime import timedelta
+from urllib.parse import quote
 
 from db import (
     save_pending_checklist, get_pending_moderation, update_moderation_status,
@@ -88,11 +90,10 @@ class ModerationView(discord.ui.View):
             if action == "accepted":
                 success = await self.handle_acceptance(mod_item, moderator, interaction)
                 if success:
-                    await interaction.response.edit_message(
-                        content=f"✅ **ACCEPTED** by {moderator}\n\n",
-                        embed=interaction.message.embeds[0] if interaction.message.embeds else None,
-                        view=None
-                    )
+                    embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+                    embed.color = 0x00ff00  # Green
+                    embed.set_footer(text=f"✅ ACCEPTED by {moderator}")
+                    await interaction.response.edit_message(embed=embed, view=None)
                 else:
                     await interaction.response.send_message("❌ Error processing acceptance.", ephemeral=True)
             
@@ -100,11 +101,10 @@ class ModerationView(discord.ui.View):
                 update_moderation_status(
                     mod_item['checklist_id'], 'rejected', moderator, species=mod_item['species']
                 )
-                await interaction.response.edit_message(
-                    content=f"❌ **REJECTED** by {moderator}\n\n",
-                    embed=interaction.message.embeds[0] if interaction.message.embeds else None,
-                    view=None
-                )
+                embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+                embed.color = 0xff0000  # Red
+                embed.set_footer(text=f"❌ REJECTED by {moderator}")
+                await interaction.response.edit_message(embed=embed, view=None)
                 logger.info(f"Rejected: {mod_item['species']} from {mod_item['checklist_id']} by {moderator}")
         
         except Exception as e:
@@ -197,10 +197,11 @@ class ModerationView(discord.ui.View):
 
             embed = await create_thread_embed(mod_item)
             
+            content, view = create_enhanced_thread_content(mod_item)
             thread = await forum_channel.create_thread(
                 name=thread_name,
-                content=f"If you'd like notifications for this report, click the 🔔 Follow button below.",
-                embed=embed
+                content=content,
+                view=view
             )
                         
             thread_record = ThreadRecord(
@@ -302,11 +303,11 @@ async def create_thread_embed(mod_item: dict) -> discord.Embed:
         timestamp=obs_datetime
     )
     
-    observer_link = f"[{mod_item.get('observer', 'Unknown')}](https://ebird.org/checklist/{mod_item['checklist_id']})"
+    observer_link = f"[{mod_item.get('observer', 'Unknown')}](<https://ebird.org/checklist/{mod_item['checklist_id']}>)"
     embed.add_field(name="Observer", value=observer_link, inline=True)
     
     if mod_item.get('lat') and mod_item.get('lon'):
-        location_link = f"[{mod_item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']})"
+        location_link = f"[{mod_item.get('location', 'Unknown')}](<https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']}>)"
         embed.add_field(name="Location", value=location_link, inline=True)
     else:
         embed.add_field(name="Location", value=mod_item.get('location', 'Unknown'), inline=True)
@@ -519,12 +520,12 @@ class ModerationSystem:
                 color=0xffaa00,
                 timestamp=obs_datetime
             )
-            
-            observer_link = f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})"
+
+            observer_link = f"[{item.get('observer', 'Unknown')}](<https://ebird.org/checklist/{item['checklist_id']}>)"
             embed.add_field(name="Observer", value=observer_link, inline=True)
             
             if item.get('lat') and item.get('lon'):
-                location_link = f"[{item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']})"
+                location_link = f"[{item.get('location', 'Unknown')}](<https://www.google.com/maps/search/?api=1&query={item['lat']},{item['lon']}>)"
                 embed.add_field(name="Location", value=location_link, inline=True)
             else:
                 embed.add_field(name="Location", value=item.get('location', 'Unknown'), inline=True)
@@ -617,7 +618,8 @@ class ModerationSystem:
                 return
             
             species = thread.tracker_key.split('|')[0]
-            new_name = f"[{thread.status_bucket}] {species}"
+            status_emoji, _ = get_status_emoji_and_text(thread.last_seen_at)
+            new_name = f"{status_emoji} {species}"
             if discord_thread.name != new_name:
                 await discord_thread.edit(name=new_name)
                 logger.info(f"Updated thread title: {new_name}")
@@ -628,3 +630,120 @@ class ModerationSystem:
 async def setup_moderation_system(bot: commands.Bot, moderation_channel_id: int, statewide_forum_channel_id: int) -> ModerationSystem:
     """Setup and return moderation system"""
     return ModerationSystem(bot, moderation_channel_id, statewide_forum_channel_id)
+
+def get_species_code_from_response(ebird_response_item):
+    """Extract species code directly from eBird API response (already includes it with detail=full)"""
+    return ebird_response_item.get('speciesCode', '')
+
+def create_map_link(species_code, lat, lon):
+    """Create eBird map link for species in area with ±0.025 lat, ±0.03 lon buffer"""
+    if not species_code or not lat or not lon:
+        return "https://ebird.org/map"
+    
+    min_lat = lat - 0.025
+    max_lat = lat + 0.025
+    min_lon = lon - 0.03
+    max_lon = lon + 0.03
+    
+    return f"https://ebird.org/map/{species_code}?env.minX={min_lon}&env.minY={min_lat}&env.maxX={max_lon}&env.maxY={max_lat}&zh=true&yr=cur"
+
+def get_status_emoji_and_text(last_seen_datetime):
+    """Get emoji and text for status based on last seen time"""
+    now_utc = datetime.now(timezone.utc)
+    delta = now_utc - last_seen_datetime
+    
+    if delta < timedelta(hours=24):
+        hours = int(delta.total_seconds() / 3600)
+        return "🟢", f"Seen in last {hours} hours" if hours > 1 else "Seen in last hour"
+    elif delta < timedelta(days=3):
+        return "🟡", f"Seen {delta.days} days ago"
+    elif delta < timedelta(days=7):
+        return "🟠", f"Seen {delta.days} days ago"
+    elif delta < timedelta(days=10):
+        return "🔴", f"Seen {delta.days} days ago"
+    else:
+        return "⚪", f"Seen {delta.days} days ago"
+
+class ThreadStatusView(discord.ui.View):
+    """View for thread status and map buttons"""
+    
+    def __init__(self, species_code, lat, lon):
+        super().__init__(timeout=None)
+        if lat and lon and species_code:
+            map_url = create_map_link(species_code, lat, lon)
+            self.add_item(discord.ui.Button(
+                label="Map of Recent Reports", 
+                style=discord.ButtonStyle.link, 
+                url=map_url
+            ))
+
+# Updated moderation response functions to add to your existing ModerationView class:
+
+def update_moderation_embed_accepted(embed, moderator):
+    """Update embed for accepted moderation"""
+    embed.color = 0x00ff00  # Green
+    embed.set_footer(text=f"✅ ACCEPTED by {moderator}")
+    return embed
+
+def update_moderation_embed_rejected(embed, moderator):
+    """Update embed for rejected moderation"""
+    embed.color = 0xff0000  # Red
+    embed.set_footer(text=f"❌ REJECTED by {moderator}")
+    return embed
+
+def create_enhanced_thread_content(mod_item):
+    """Create enhanced thread content with your requested format"""
+    species = mod_item['species']
+    region = mod_item['region']
+    location = mod_item.get('location', 'Unknown Location')
+    observer = mod_item.get('observer', 'Unknown')
+    checklist_id = mod_item['checklist_id']
+    lat, lon = mod_item.get('lat'), mod_item.get('lon')
+    has_media = mod_item.get('has_media', False)
+    
+    # Parse datetime (using your existing safe_datetime_parse)
+    from moderation import safe_datetime_parse
+    from time_utils import ebird_local_to_utc
+    
+    obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
+    if obs_datetime is None:
+        obs_datetime = datetime.now(timezone.utc)
+    elif obs_datetime.tzinfo is None:
+        obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
+    elif obs_datetime.tzinfo != timezone.utc:
+        obs_datetime = obs_datetime.astimezone(timezone.utc)
+    
+    # Get status emoji and text
+    status_emoji, status_text = get_status_emoji_and_text(obs_datetime)
+    
+    # Create content string in your requested format
+    content = f"{status_emoji} {status_text}\n"
+    content += f"If you'd like notifications for this report, click the Follow button below.\n"
+    content += f"▸ {location}\n"
+    content += f"▸ Earliest record by: [**{observer}**](<https://ebird.org/checklist/{checklist_id}>)"
+    
+    if has_media:
+        content += " 📷"
+    
+    content += f"\n▸ Check the [**eBird Checklist**](<https://ebird.org/checklist/{checklist_id}>) for more details.\n"
+    content += f"▸ 1 positive checklists / 0 negative checklists in last 24 hours.\n\n"
+    content += f"*Last seen: {obs_datetime.strftime('%Y-%m-%d %H:%M')}* ▸ Reported in last 24 hours by: "
+    content += f"[{observer}](<https://ebird.org/checklist/{checklist_id}>)"
+    
+    if has_media:
+        content += " 📷"
+    
+    # Get species code from mod_item if available (should be there from eBird API)
+    species_code = mod_item.get('species_code', '')
+    
+    # Create view with map button
+    view = ThreadStatusView(species_code, lat or 0, lon or 0) if species_code else None
+    
+    return content, view
+
+def update_thread_title_with_status(thread_name, status_emoji):
+    """Update thread title with status emoji for easy scanning"""
+    # Remove existing emoji if present
+    import re
+    clean_name = re.sub(r'^[🟢🟡🟠🔴⚪]\s*', '', thread_name)
+    return f"{status_emoji} {clean_name}"
