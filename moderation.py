@@ -1,4 +1,4 @@
-# FIXES FOR YOUR MODERATION ISSUES
+# COMPREHENSIVE FIXES FOR MODERATION SYSTEM
 
 import discord
 from discord.ext import commands, tasks
@@ -10,7 +10,7 @@ from typing import List, Dict, Optional
 import pytz
 
 from db import (
-    save_pending_checklist, get_pending_moderation, update_moderation_status,
+    save_pending_checklist_with_aggregation, get_pending_moderation, update_moderation_status,
     is_checklist_rejected, find_nearby_thread, save_thread, add_thread_participant,
     mark_checklist_processed_for_moderation,
     get_moderation_item_by_message_id, get_checklists_for_thread, get_thread_participants
@@ -19,7 +19,7 @@ from co_review_loader import is_species_statewide_rba, get_species_review_status
 from models import Observation, ThreadRecord
 from ebird_api import fetch_ebird_rba
 from time_utils import ebird_local_to_utc, get_timezone_name
-from geo_utils import normalize_species_name
+from geo_utils import normalize_species_name, haversine
 
 logger = logging.getLogger("Dipper_RBA_Bot")
 
@@ -91,8 +91,9 @@ def utc_to_local_time(utc_dt, lat, lon):
         local_tz = pytz.timezone(tz_name)
         return utc_dt.astimezone(local_tz)
     except:
-        # Fallback to UTC
         return utc_dt
+
+# DATABASE ADDITIONS NEEDED:
 
 class ThreadStatusView(discord.ui.View):
     """View for thread status and map buttons"""
@@ -117,6 +118,43 @@ class ThreadStatusView(discord.ui.View):
                 style=discord.ButtonStyle.link, 
                 url=checklist_url
             ))
+
+class MergeDropdownView(discord.ui.View):
+    """View with merge dropdown for nearby threads"""
+    
+    def __init__(self, merge_candidates: List[dict]):
+        super().__init__(timeout=300)  # 5 minute timeout
+        
+        if merge_candidates:
+            options = [
+                discord.SelectOption(
+                    label=f"{candidate['location']} ({candidate['distance_km']}km)",
+                    value=candidate['tracker_key'],
+                    description=f"Last seen: {candidate['last_seen'][:10]}"
+                )
+                for candidate in merge_candidates[:10]  # Discord limit
+            ]
+            options.append(discord.SelectOption(
+                label="Create New Thread",
+                value="new_thread",
+                description="Create a separate thread for this location"
+            ))
+            
+            self.add_item(MergeSelect(options))
+
+class MergeSelect(discord.ui.Select):
+    """Dropdown for selecting merge target"""
+    
+    def __init__(self, options):
+        super().__init__(placeholder="Choose merge target or create new thread...", options=options)
+    
+    async def callback(self, interaction: discord.Interaction):
+        # Handle merge selection (implement based on your needs)
+        selected_value = self.values[0]
+        if selected_value == "new_thread":
+            await interaction.response.send_message("Creating new thread...", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Merging with thread: {selected_value}", ephemeral=True)
 
 class ModerationView(discord.ui.View):
     """Persistent view for moderation buttons"""
@@ -184,35 +222,30 @@ class ModerationView(discord.ui.View):
             region = mod_item['region']
             
             logger.debug(f"Processing acceptance for {species}")
-            logger.debug(f"Raw obs_datetime from mod_item: {mod_item.get('obs_datetime')}")
-            logger.debug(f"Obs datetime type: {type(mod_item.get('obs_datetime'))}")
             
-            # CRITICAL FIX: Parse datetime first, then convert to UTC if needed
+            # FIX: Parse datetime first, then convert to UTC if needed
             obs_datetime_raw = mod_item.get('obs_datetime')
             obs_datetime = safe_datetime_parse(obs_datetime_raw)
             
             if obs_datetime is None:
                 logger.error(f"Could not parse obs_datetime: {obs_datetime_raw}")
-                obs_datetime = datetime.now(timezone.utc)  # Fallback to current time
+                obs_datetime = datetime.now(timezone.utc)
             else:
-                # If we successfully parsed it, ensure it's in UTC
+                # Ensure it's in UTC
                 if obs_datetime.tzinfo is None:
-                    # No timezone info, need to convert from local to UTC
                     obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
                 elif obs_datetime.tzinfo != timezone.utc:
-                    # Has timezone but not UTC, convert to UTC
                     obs_datetime = obs_datetime.astimezone(timezone.utc)
             
-            logger.debug(f"Parsed obs_datetime: {obs_datetime} of type {type(obs_datetime)}")
-            
+            # Check for nearby existing thread (2km auto-merge)
             existing_thread_key = None
             if lat is not None and lon is not None:
                 existing_thread_key = find_nearby_thread(species, lat, lon, distance_km=2.0)
             
             if existing_thread_key:
-                # Merge with existing thread - just add participant and update content
+                # Auto-merge with existing thread
                 thread_tracker_key = existing_thread_key
-                logger.info(f"Merging {species} with existing thread {thread_tracker_key}")
+                logger.info(f"Auto-merging {species} with existing thread {thread_tracker_key}")
                 
                 # Add participant to thread
                 add_thread_participant(
@@ -226,59 +259,61 @@ class ModerationView(discord.ui.View):
                 await self.update_thread_content(interaction.client, thread_tracker_key)
                 
             else:
-                # Create new thread
-                thread_tracker_key = f"{species}|{region}|{obs_datetime.strftime('%b %Y')}"
+                # Check for merge candidates (2-10km)
+                merge_candidates = get_merge_candidates(species, lat or 0, lon or 0, distance_km=10.0) if lat and lon else []
                 
-                # Create thread in statewide forum
-                statewide_forum_channel_id = getattr(interaction.client, 'statewide_forum_channel_id', None)
-                logger.info(f"Creating new thread for {species} in forum channel {statewide_forum_channel_id}")
-
-                if statewide_forum_channel_id:
-                    forum_channel = interaction.guild.get_channel(int(statewide_forum_channel_id))
-                    logger.info(f"Forum channel object: {forum_channel}")
-                    logger.info(f"Forum channel type: {type(forum_channel)}")
-                    logger.info(f"Is ForumChannel: {isinstance(forum_channel, discord.ForumChannel)}")
-
-                    if forum_channel and isinstance(forum_channel, discord.ForumChannel):
-                        # Create thread in forum
-                        region_str = mod_item.get('region', 'Unknown Region')
-                        thread_name = f"{species}, {region_str}, {obs_datetime.strftime('%b %Y')}"
-                        logger.info(f"Creating thread with name: {thread_name} and {thread_tracker_key}")
-                        
-                        # CREATE: Enhanced thread content instead of embed
-                        content, view = await self.create_enhanced_thread_content(mod_item, thread_tracker_key)
-                        logger.info(f"Creating thread with content: {content}")
-                        logger.info(f"Creating thread with view: {view}")
-
-                        thread = await forum_channel.create_thread(
-                            name=thread_name,
-                            content=content,
-                            view=view
-                        )
-                        
-                        # Save thread to database
-                        thread_record = ThreadRecord(
-                            tracker_key=thread_tracker_key,
-                            thread_id=thread.thread.id,
-                            type="bot",
-                            last_seen_at=obs_datetime,
-                            status_bucket="<24h"
-                        )
-                        thread_record.discord_channel_id = thread.thread.id
-                        thread_record.discord_message_id = thread.message.id
-                        save_thread(thread_record)
-                        
-                        # Add participant to new thread
-                        add_thread_participant(
-                            thread_tracker_key, 
-                            mod_item.get('observer', 'Unknown'), 
-                            mod_item['checklist_id'], 
-                            obs_datetime
-                        )
-                        
-                        logger.info(f"Created new thread {thread_tracker_key} in forum")
-                    else:
-                        logger.error(f"Forum channel check failed. Channel: {forum_channel}, Type: {type(forum_channel)}")
+                if merge_candidates:
+                    # Show merge dropdown
+                    merge_view = MergeDropdownView(merge_candidates)
+                    await interaction.response.send_message(
+                        f"Found nearby threads for {species}. Choose merge target:", 
+                        view=merge_view, 
+                        ephemeral=True
+                    )
+                    return True  # Don't create thread yet, wait for user choice
+                else:
+                    # Create new thread
+                    # FIX: Use correct tracker key format
+                    thread_tracker_key = f"{species}|{region}|{obs_datetime.strftime('%b %Y')}"
+                    
+                    # Create thread in statewide forum
+                    statewide_forum_channel_id = getattr(interaction.client, 'statewide_forum_channel_id', None)
+                    if statewide_forum_channel_id:
+                        forum_channel = interaction.guild.get_channel(int(statewide_forum_channel_id))
+                        if forum_channel and isinstance(forum_channel, discord.ForumChannel):
+                            # Create thread in forum
+                            thread_name = f"{species}, {region}, {obs_datetime.strftime('%b %Y')}"
+                            
+                            # Create enhanced thread content
+                            content, view = await self.create_enhanced_thread_content(mod_item, thread_tracker_key)
+                            
+                            thread = await forum_channel.create_thread(
+                                name=thread_name,
+                                content=content,
+                                view=view
+                            )
+                            
+                            # Save thread to database
+                            thread_record = ThreadRecord(
+                                tracker_key=thread_tracker_key,
+                                thread_id=thread.thread.id,
+                                type="bot",
+                                last_seen_at=obs_datetime,
+                                status_bucket="<24h"
+                            )
+                            thread_record.discord_channel_id = thread.thread.id
+                            thread_record.discord_message_id = thread.message.id
+                            save_thread(thread_record)
+                            
+                            # Add participant to new thread
+                            add_thread_participant(
+                                thread_tracker_key, 
+                                mod_item.get('observer', 'Unknown'), 
+                                mod_item['checklist_id'], 
+                                obs_datetime
+                            )
+                            
+                            logger.info(f"Created new thread {thread_tracker_key} in forum")
             
             # Update moderation status
             update_moderation_status(
@@ -303,34 +338,23 @@ class ModerationView(discord.ui.View):
         lat, lon = mod_item.get('lat'), mod_item.get('lon')
         has_media = mod_item.get('has_media', False)
         species_code = mod_item.get('species_code', '')
-
-        logger.info(f"Creating thread content for {species} - {checklist_id}")
-        logger.info(f"Raw obs_datetime from mod_item: {mod_item.get('obs_datetime')} of type {type(mod_item.get('obs_datetime'))}")
-        logger.info(f"species_code: {species_code}, has_media: {has_media}")
         
-        # Parse and convert datetime to local time for display
-        obs_datetime_raw = mod_item.get('obs_datetime')
-        obs_datetime = safe_datetime_parse(obs_datetime_raw)
-        logger.info(f"Parsed obs_datetime from obs_datetime: {obs_datetime} of type {type(obs_datetime)}")
+        # Parse datetime
+        obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
         if obs_datetime is None:
             obs_datetime = datetime.now(timezone.utc)
         elif obs_datetime.tzinfo is None:
             obs_datetime = ebird_local_to_utc(obs_datetime, lat, lon)
         elif obs_datetime.tzinfo != timezone.utc:
             obs_datetime = obs_datetime.astimezone(timezone.utc)
-
-        logger.info(f"Parsed obs_datetime with timezone: {obs_datetime} of type {type(obs_datetime)}")
         
         # Convert to local time for display
-        if lat and lon:
-            local_datetime = utc_to_local_time(obs_datetime, lat, lon)
-        else:
-            local_datetime = obs_datetime
+        local_datetime = utc_to_local_time(obs_datetime, lat, lon) if lat and lon else obs_datetime
         
         # Get status emoji and text
         status_emoji, status_text = get_status_emoji_and_text(obs_datetime)
         
-        # Create content string in your requested format
+        # Create content string in requested format
         content = f"**{species}, {region}, {local_datetime.strftime('%b %Y')}**\n\n"
         content += f"{status_emoji} {status_text}\n"
         content += f"If you'd like notifications for this report, click the Follow button below.\n"
@@ -342,18 +366,18 @@ class ModerationView(discord.ui.View):
         
         content += f"\n▸ Check the [**eBird Checklist**](<https://ebird.org/checklist/{checklist_id}>) for more details.\n"
         content += f"▸ 1 positive checklists / 0 negative checklists in last 24 hours.\n\n"
-        content += f"▸ Reported in last 24 hours by: [{observer}](<https://ebird.org/checklist/{checklist_id}>)\n"
-        content += f"*Last seen: {local_datetime.strftime('%Y-%m-%d %H:%M')}*"
-        
+        content += f"▸ Reported in last 24 hours by: [{observer}](<https://ebird.org/checklist/{checklist_id}>)"
         
         if has_media:
             content += " 📷"
+        
+        content += f"\n\n*Last seen: {local_datetime.strftime('%Y-%m-%d %H:%M')}*"
         
         # Create view with buttons
         view = ThreadStatusView(species_code, lat, lon, checklist_id)
         
         return content, view
-    
+
     async def update_thread_content(self, bot, thread_tracker_key: str):
         """Update existing thread content with new data"""
         try:
@@ -383,7 +407,7 @@ class ModerationView(discord.ui.View):
                         logger.error(f"Error updating thread message: {e}")
         except Exception as e:
             logger.error(f"Error in update_thread_content: {e}")
-    
+
     async def refresh_thread_content(self, message: discord.Message, thread_tracker_key: str, checklists: List[Observation]):
         """Refresh thread content with updated statistics"""
         try:
@@ -406,12 +430,9 @@ class ModerationView(discord.ui.View):
             status_emoji, status_text = get_status_emoji_and_text(latest_obs.obs_datetime)
             
             # Convert to local time for display
-            if latest_obs.lat and latest_obs.lon:
-                local_datetime = utc_to_local_time(latest_obs.obs_datetime, latest_obs.lat, latest_obs.lon)
-            else:
-                local_datetime = latest_obs.obs_datetime
+            local_datetime = utc_to_local_time(latest_obs.obs_datetime, latest_obs.lat, latest_obs.lon) if latest_obs.lat and latest_obs.lon else latest_obs.obs_datetime
             
-            # Build content
+            # Build content with your updated format
             content = f"**{species}, {region}, {local_datetime.strftime('%b %Y')}**\n\n"
             content += f"{status_emoji} {status_text}\n"
             content += f"If you'd like notifications for this report, click the Follow button below.\n"
@@ -434,8 +455,7 @@ class ModerationView(discord.ui.View):
                 recent_reporter_links.append(link)
             
             content += ", ".join(recent_reporter_links)
-
-            content += f"*Last seen: {local_datetime.strftime('%Y-%m-%d %H:%M')}*"
+            content += f"\n\n*Last seen: {local_datetime.strftime('%Y-%m-%d %H:%M')}*"
             
             # Update view with latest checklist
             view = ThreadStatusView(
@@ -449,29 +469,6 @@ class ModerationView(discord.ui.View):
             
         except Exception as e:
             logger.error(f"Error refreshing thread content: {e}")
-
-async def create_thread_embed(mod_item: dict) -> discord.Embed:
-    """Create embed for thread post"""
-    # Safely parse datetime for embed
-    obs_datetime = safe_datetime_parse(mod_item.get('obs_datetime'))
-    if obs_datetime is None:
-        obs_datetime = datetime.now(timezone.utc)
-    elif obs_datetime.tzinfo is None:
-        obs_datetime = ebird_local_to_utc(obs_datetime, mod_item.get('lat'), mod_item.get('lon'))
-    elif obs_datetime.tzinfo != timezone.utc:
-        obs_datetime = obs_datetime.astimezone(timezone.utc)
-    
-    embed = discord.Embed(
-        title=f"{mod_item['species']}, {mod_item['region']}, {obs_datetime.strftime('%b %Y')}",
-        color=0xffaa00,
-        timestamp=obs_datetime
-    )
-    
-    embed.add_field(name="Observer", value=f"[{mod_item.get('observer', 'Unknown')}](https://ebird.org/checklist/{mod_item['checklist_id']})", inline=True)
-    embed.add_field(name="Location", value=f"[{mod_item.get('location', 'Unknown')}](https://www.google.com/maps/search/?api=1&query={mod_item['lat']},{mod_item['lon']})", inline=True)
-    embed.add_field(name="County", value=mod_item.get('region', 'Unknown'), inline=True)
-    
-    return embed
 
 class ModerationSystem:
     """Main moderation system class"""
@@ -566,6 +563,18 @@ class ModerationSystem:
             logger.error(f"Error fetching statewide observations: {e}")
             return []
     
+    # async def process_observation_for_moderation(self, obs: Observation):
+    #     """Process a single observation to see if it needs moderation"""
+    #     try:
+    #         # Skip if already processed
+    #         if is_checklist_rejected(obs.checklist_id, obs.species):
+    #             return
+            
+    #         # Check if it's a statewide RBA species using CO Review List
+    #         if not is_species_statewide_rba(normalize_species_name(obs.species)):
+    #             mark_checklist_processed_for_moderation(obs.checklist_id)
+    #             return
+            
     async def process_observation_for_moderation(self, obs: Observation):
         """Process a single observation to see if it needs moderation"""
         try:
@@ -574,12 +583,11 @@ class ModerationSystem:
                 return
             
             # Check if it's a statewide RBA species using CO Review List
-            # Use common name (obs.species) instead of species code
             if not is_species_statewide_rba(normalize_species_name(obs.species)):
                 mark_checklist_processed_for_moderation(obs.checklist_id)
                 return
             
-            # CHANGE: Reduce merge distance to 2km and skip moderation within that range
+            # Check if nearby thread exists (within 2km) - auto-merge
             if obs.lat is not None and obs.lon is not None:
                 nearby_thread = find_nearby_thread(obs.species, obs.lat, obs.lon, 2.0)
                 if nearby_thread:
@@ -589,13 +597,15 @@ class ModerationSystem:
                     )
                     mark_checklist_processed_for_moderation(obs.checklist_id)
                     await self.update_thread_recency_for_key(nearby_thread)
-                    logger.info(f"Added {obs.species} to existing thread {nearby_thread}")
+                    logger.info(f"Auto-merged {obs.species} to existing thread {nearby_thread}")
                     return
             
-            # Needs moderation - add to queue
-            success = save_pending_checklist(obs)
+            # Use aggregation logic for moderation queue
+            success = save_pending_checklist_with_aggregation(obs)
             if success:
                 logger.info(f"Added {obs.species} from {obs.checklist_id} to moderation queue")
+            else:
+                logger.info(f"Skipped {obs.species} from {obs.checklist_id} - too close to existing pending")
             
             mark_checklist_processed_for_moderation(obs.checklist_id)
             
@@ -634,7 +644,7 @@ class ModerationSystem:
             if obs_datetime is None:
                 obs_datetime = datetime.now(timezone.utc)
             
-            # ADD: Include has_media info for camera emoji
+            # Include has_media info for camera emoji
             has_media = item.get('has_media', False)
             
             embed = discord.Embed(
@@ -643,7 +653,7 @@ class ModerationSystem:
                 timestamp=obs_datetime
             )
             
-            observer_text = f"[{item.get('observer', 'Unknown')}](https://ebird.org/checklist/{item['checklist_id']})"
+            observer_text = f"[{item.get('observer', 'Unknown')}](<https://ebird.org/checklist/{item['checklist_id']}>)"
             if has_media:
                 observer_text += " 📷"
             
@@ -721,7 +731,7 @@ class ModerationSystem:
                 # Update Discord thread title if possible
                 await self.update_discord_thread_title(thread)
                 
-            # ALSO: Update thread content with fresh data every 10 minutes
+            # CRITICAL: Update thread content every 10 minutes
             moderation_view = ModerationView()
             await moderation_view.update_thread_content(self.bot, thread_tracker_key)
                 
@@ -741,7 +751,7 @@ class ModerationSystem:
             # Extract species name from tracker key
             species = thread.tracker_key.split('|')[0]
             
-            # CHANGE: Use emoji instead of text buckets for easy scanning
+            # Use emoji instead of text buckets for easy scanning
             status_emoji, _ = get_status_emoji_and_text(thread.last_seen_at)
             new_name = f"{status_emoji} {species}"
             
@@ -755,62 +765,3 @@ class ModerationSystem:
 async def setup_moderation_system(bot: commands.Bot, moderation_channel_id: int, statewide_forum_channel_id: int) -> ModerationSystem:
     """Setup and return moderation system"""
     return ModerationSystem(bot, moderation_channel_id, statewide_forum_channel_id)
-
-# ADDITIONAL FIXES FOR DATABASE FUNCTIONS
-
-def get_thread_statistics_for_update(thread_tracker_key: str) -> dict:
-    """Get comprehensive thread statistics for content updates"""
-    from db import get_connection
-    conn = get_connection()
-    
-    try:
-        # Get all checklists for this thread with proper dict conversion
-        rows = conn.execute("""
-            SELECT checklist_id, species, region, location, observer, obs_datetime, 
-                   lat, lon, has_media, species_code
-            FROM checklists 
-            WHERE thread_tracker_key = ?
-            ORDER BY obs_datetime DESC
-        """, (thread_tracker_key,)).fetchall()
-        
-        if not rows:
-            return {'checklists': [], 'recent_count': 0}
-        
-        # Convert to Observation objects properly
-        checklists = []
-        for row in rows:
-            # Convert row to dict first to avoid the sqlite3.Row error
-            row_dict = dict(row)
-            obs = Observation(
-                checklist_id=row_dict["checklist_id"],
-                species=row_dict["species"],
-                region=row_dict["region"],
-                location=row_dict.get("location", "Unknown"),
-                observer=row_dict.get("observer", "Unknown"),
-                obs_datetime=datetime.fromisoformat(row_dict["obs_datetime"]),
-                local_tz="UTC",  # We'll convert this as needed
-                thread_tracker_key=thread_tracker_key,
-                lat=row_dict.get("lat"),
-                lon=row_dict.get("lon"),
-                has_media=bool(row_dict.get("has_media", 0))
-            )
-            # Add species code if available
-            if row_dict.get("species_code"):
-                obs.species_code = row_dict["species_code"]
-            
-            checklists.append(obs)
-        
-        # Calculate 24-hour stats
-        now_utc = datetime.now(timezone.utc)
-        cutoff_24h = now_utc - timedelta(hours=24)
-        recent_reports = [obs for obs in checklists if obs.obs_datetime >= cutoff_24h]
-        
-        return {
-            'checklists': checklists,
-            'recent_count': len(recent_reports),
-            'latest_obs': checklists[0] if checklists else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting thread statistics: {e}")
-        return {'checklists': [], 'recent_count': 0}

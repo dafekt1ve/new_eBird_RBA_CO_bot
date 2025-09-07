@@ -501,3 +501,77 @@ def update_moderation_status(checklist_id: str, status: str, moderated_by: str =
                         """, (checklist_id, species_row['species'], moderated_by))
             except sqlite3.IntegrityError:
                 pass  # Already exists
+
+def save_pending_checklist_with_aggregation(obs: Observation) -> bool:
+    """Save to moderation queue with location-based aggregation"""
+    from db import get_connection
+    conn = get_connection()
+    
+    try:
+        # Check if there's already a pending moderation for this species within 2km
+        if obs.lat and obs.lon:
+            existing_rows = conn.execute("""
+                SELECT id, checklist_id, lat, lon FROM moderation_queue 
+                WHERE species = ? AND status = 'pending' 
+                AND lat IS NOT NULL AND lon IS NOT NULL
+            """, (obs.species,)).fetchall()
+            
+            for row in existing_rows:
+                existing_lat, existing_lon = row['lat'], row['lon']
+                if haversine(obs.lat, obs.lon, existing_lat, existing_lon) <= 2.0:
+                    # Within 2km of existing pending moderation - skip this one
+                    logger.info(f"Skipping {obs.species} - within 2km of existing pending moderation")
+                    return False
+        
+        # No nearby pending moderation found, add to queue
+        with conn:
+            conn.execute("""
+                INSERT INTO moderation_queue (
+                    checklist_id, species, species_code, region, observer, 
+                    location, lat, lon, obs_datetime, has_media
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                obs.checklist_id, obs.species, getattr(obs, 'species_code', ''),
+                obs.region, obs.observer, obs.location, obs.lat, obs.lon, 
+                obs.obs_datetime.isoformat(), obs.has_media
+            ))
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in save_pending_checklist_with_aggregation: {e}")
+        return False
+
+def get_merge_candidates(species: str, lat: float, lon: float, distance_km: float = 10.0) -> List[dict]:
+    """Get potential merge candidates for moderation dropdown"""
+    from db import get_connection
+    conn = get_connection()
+    
+    candidates = []
+    try:
+        # Get threads for this species within distance
+        rows = conn.execute("""
+            SELECT DISTINCT t.tracker_key, t.last_seen_at, c.location, c.lat, c.lon
+            FROM threads t
+            JOIN checklists c ON t.tracker_key = c.thread_tracker_key
+            WHERE c.species = ? AND c.lat IS NOT NULL AND c.lon IS NOT NULL
+            ORDER BY t.last_seen_at DESC
+            LIMIT 5
+        """, (species,)).fetchall()
+        
+        for row in rows:
+            thread_lat, thread_lon = row['lat'], row['lon']
+            distance = haversine(lat, lon, thread_lat, thread_lon)
+            if 2.0 < distance <= distance_km:  # Beyond auto-merge but within consideration
+                candidates.append({
+                    'tracker_key': row['tracker_key'],
+                    'location': row['location'],
+                    'distance_km': round(distance, 1),
+                    'last_seen': row['last_seen_at']
+                })
+        
+        return candidates
+        
+    except Exception as e:
+        logger.error(f"Error getting merge candidates: {e}")
+        return []
